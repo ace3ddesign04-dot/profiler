@@ -26,9 +26,6 @@ public class FPSCounter : MonoBehaviour {
     private const float SmoothFactor = 0.1f;
     private AverageWindow[] _windowValues;
 
-    [Header("Inspector Assigned")]
-    [SerializeField] private Transform container;
-
     [Header("UI Text Fields")]
     [SerializeField] private Text textCurrentFPS;
     [SerializeField] private Text textAverageFPS;
