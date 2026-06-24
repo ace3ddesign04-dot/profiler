@@ -39,7 +39,7 @@ public class SceneScanReportWindow : EditorWindow {
         public string comparison;
         public float threshold;
         public float value;
-        public string rawText;
+        public string sceneName;
         public float scanTimeSeconds;
         public int frame;
         public Vector3 cameraPosition;
@@ -309,7 +309,7 @@ public class SceneScanReportWindow : EditorWindow {
         EditorGUILayout.LabelField("Comparison", Safe(violation.comparison));
         EditorGUILayout.FloatField("Threshold", violation.threshold);
         EditorGUILayout.FloatField("Value", violation.value);
-        EditorGUILayout.LabelField("Raw Text", Safe(violation.rawText));
+        EditorGUILayout.LabelField("Scene Name", Safe(violation.sceneName));
 
         EditorGUILayout.Space(4f);
 

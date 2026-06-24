@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using UnityEngine;
+using UnityEngine.SceneManagement;
 
 public class RuntimeSceneScanReportGUI : MonoBehaviour {
     [Serializable]
@@ -30,7 +31,7 @@ public class RuntimeSceneScanReportGUI : MonoBehaviour {
         public string comparison;
         public float threshold;
         public float value;
-        public string rawText;
+        public string sceneName;
         public float scanTimeSeconds;
         public int frame;
         public Vector3 cameraPosition;
@@ -563,7 +564,7 @@ public class RuntimeSceneScanReportGUI : MonoBehaviour {
         GUILayout.Label("Comparison: " + Safe(violation.comparison), _smallLabelStyle);
         GUILayout.Label("Threshold: " + violation.threshold.ToString("F3"), _smallLabelStyle);
         GUILayout.Label("Value: " + violation.value.ToString("F3"), _smallLabelStyle);
-        GUILayout.Label("Raw Text: " + Safe(violation.rawText), _smallLabelStyle);
+        GUILayout.Label("Scene Name: " + Safe(violation.sceneName), _smallLabelStyle);
 
         GUILayout.Space(4f);
 

@@ -361,6 +361,9 @@ public class SceneScanner : MonoBehaviour {
     }
 
     private void Update() {
+        if (targetCamera == null)
+            targetCamera = Camera.main;
+
         if (Input.GetKeyDown(startKey))
             StartScan();
 
@@ -842,7 +845,7 @@ public class SceneScanner : MonoBehaviour {
                     _activeReport.violations.Count < maxViolationsInReport
                 ) {
                     thresholdConfig.lastViolationRecordTime = now;
-                    AddViolation(thresholdConfig, value, raw);
+                    AddViolation(thresholdConfig, value);
                 }
             }
 
@@ -850,7 +853,7 @@ public class SceneScanner : MonoBehaviour {
         }
     }
 
-    private void AddViolation(StatThreshold thresholdConfig, float value, string rawText) {
+    private void AddViolation(StatThreshold thresholdConfig, float value) {
         ViolationRecord record = new ViolationRecord();
         record.sampleIndex = currentSampleIndex;
         record.statId = thresholdConfig.statItem.ToString();
