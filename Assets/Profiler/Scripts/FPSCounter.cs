@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.UI;
@@ -14,6 +15,11 @@ public class FPSCounter : MonoBehaviour {
         TenSeconds = 10,
         ThirtySeconds = 30
     }
+    private enum TargetFrameRate {
+        Thirty = 30,
+        Sixty = 60,
+        OneTwenty = 120
+    }
 
     private bool pause;
     private float _currentFPS;
@@ -26,6 +32,9 @@ public class FPSCounter : MonoBehaviour {
     private const float SmoothFactor = 0.1f;
     private AverageWindow[] _windowValues;
 
+    [Header("Application Target FPS")]
+    [SerializeField] private TargetFrameRate targetFrameRate = TargetFrameRate.Sixty;
+
     [Header("UI Text Fields")]
     [SerializeField] public Text textCurrentFPS;
     [SerializeField] public Text textAverageFPS;
@@ -33,6 +42,7 @@ public class FPSCounter : MonoBehaviour {
     [SerializeField] public Text textMaxFPS;
     [SerializeField] public Button buttonPause;
     [SerializeField] public Button buttonReset;
+
 
     [Header("UI Dropdown")]
     [Tooltip("Dropdown for selecting the average window at runtime. Options are populated automatically.")]
@@ -55,6 +65,8 @@ public class FPSCounter : MonoBehaviour {
     [SerializeField] private Color colorExcellent = new Color(0.20f, 0.70f, 1.00f);
 
     private void Start() {
+
+        Application.targetFrameRate = (int)targetFrameRate;
         buttonPause.onClick.AddListener(OnClickPauseResume);
         buttonReset.onClick.AddListener(OnClickResetResetStats);
         InitDropdown();

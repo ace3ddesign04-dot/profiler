@@ -5,6 +5,7 @@ using System.Globalization;
 using System.IO;
 using System.Text.RegularExpressions;
 using UnityEngine;
+using UnityEngine.Events;
 using UnityEngine.SceneManagement;
 using UnityEngine.UI;
 
@@ -29,7 +30,8 @@ using UnityEngine.UI;
 public class ReleaseBuildSceneScanner : MonoBehaviour {
     public enum ScanMode {
         AutoBounds,
-        Waypoints
+        Waypoints,
+        Manual
     }
 
     public enum NumericComparison {
@@ -241,8 +243,13 @@ public class ReleaseBuildSceneScanner : MonoBehaviour {
     public Camera targetCamera;
     public bool startOnPlay;
     public bool useUnscaledTime = true;
+    [Tooltip("Used only in Manual mode. If true, pressing Stop in Manual mode also invokes On Scan Completed.")]
+    public bool manualStopCountsAsCompleted = true;
     public KeyCode startKey = KeyCode.F8;
     public KeyCode stopKey = KeyCode.F9;
+
+    [Header("Output Information")]
+    public Text textScanProgress;
 
     [Header("Profiler Sources")]
     [Tooltip("If enabled, scanner tries to find FPSCounter / PerformanceMonitor / DeviceThermal automatically on Awake and StartScan.")]
@@ -293,6 +300,13 @@ public class ReleaseBuildSceneScanner : MonoBehaviour {
     public string reportFilePrefix = "SceneScan";
     [TextArea(1, 3)] public string lastReportPath;
 
+    [Header("Editor Report Viewer")]
+    public bool openReportWindowWhenScanCompletes = true; 
+    
+    [Header("Runtime Report GUI")]
+    public RuntimeSceneScanReportGUI runtimeReportGUI;
+    public bool openRuntimeReportGUIWhenScanCompletes = true;
+
     [Header("Runtime Progress - Read Only")]
     public bool isScanning;
     [Range(0f, 1f)] public float scanProgress01;
@@ -314,6 +328,11 @@ public class ReleaseBuildSceneScanner : MonoBehaviour {
     public Color waypointForwardGizmoColor = new Color(0.2f, 1f, 0.2f, 0.9f);
     [Min(0.1f)] public float waypointForwardArrowLength = 4f;
     [Min(0.05f)] public float gizmoSphereRadius = 0.8f;
+
+    [Header("Scan Events")]
+    public UnityEvent onScanStarted;
+    public UnityEvent onScanStopped;
+    public UnityEvent onScanCompleted;
 
     private readonly List<PathPoint> _path = new List<PathPoint>();
     private Coroutine _scanRoutine;
@@ -352,6 +371,9 @@ public class ReleaseBuildSceneScanner : MonoBehaviour {
             currentCameraPosition = targetCamera.transform.position;
             currentCameraEulerAngles = targetCamera.transform.eulerAngles;
         }
+
+        if (textScanProgress != null)
+            textScanProgress.text = scanProgressText;
     }
 
     [ContextMenu("Auto Find Profilers")]
@@ -385,12 +407,13 @@ public class ReleaseBuildSceneScanner : MonoBehaviour {
         ResetThresholdRuntimeState();
 
         _path.Clear();
+
         if (scanMode == ScanMode.AutoBounds)
             BuildAutoBoundsPath(_path);
-        else
+        else if (scanMode == ScanMode.Waypoints)
             BuildWaypointPath(_path);
 
-        if (_path.Count == 0) {
+        if (scanMode != ScanMode.Manual && _path.Count == 0) {
             Debug.LogWarning("ReleaseBuildSceneScanner: No scan path generated.", this);
             return;
         }
@@ -404,6 +427,9 @@ public class ReleaseBuildSceneScanner : MonoBehaviour {
 
     [ContextMenu("Stop Scan And Write Report")]
     public void StopScanAndWriteReport() {
+        bool wasScanning = isScanning || _scanRoutine != null;
+        bool wasManualScan = scanMode == ScanMode.Manual;
+
         if (_scanRoutine != null) {
             StopCoroutine(_scanRoutine);
             _scanRoutine = null;
@@ -413,7 +439,18 @@ public class ReleaseBuildSceneScanner : MonoBehaviour {
             FinishReportAndWriteFile();
 
         isScanning = false;
-        scanProgressText = "Stopped";
+
+        if (wasManualScan)
+            scanProgressText = "Manual Scan Stopped";
+        else
+            scanProgressText = "Stopped";
+
+        if (wasScanning) {
+            if (wasManualScan && manualStopCountsAsCompleted)
+                onScanCompleted?.Invoke();
+
+            onScanStopped?.Invoke();
+        }
     }
 
     [ContextMenu("Clear Runtime Report Data")]
@@ -421,6 +458,7 @@ public class ReleaseBuildSceneScanner : MonoBehaviour {
         lastReportPath = string.Empty;
         scanProgress01 = 0f;
         scanProgressText = string.Empty;
+        textScanProgress.text = "";
         currentSampleIndex = 0;
         currentViolationCount = 0;
         currentPathLabel = string.Empty;
@@ -449,6 +487,8 @@ public class ReleaseBuildSceneScanner : MonoBehaviour {
         _scanStartRealtime = Time.realtimeSinceStartup;
         _nextSampleRealtime = Time.realtimeSinceStartup + warmupSecondsBeforeScan;
 
+        onScanStarted?.Invoke();
+
         _activeReport = new ScanReport();
         _activeReport.sceneName = SceneManager.GetActiveScene().name;
         _activeReport.mode = scanMode.ToString();
@@ -459,6 +499,11 @@ public class ReleaseBuildSceneScanner : MonoBehaviour {
         _activeReport.boundsSize = boundsSize;
         _activeReport.configuredThresholdCount = thresholds != null ? thresholds.Count : 0;
         _activeReport.enabledThresholdCount = CountEnabledThresholds();
+
+        if (scanMode == ScanMode.Manual) {
+            yield return RunManualScan();
+            yield break;
+        }
 
         targetCamera.transform.position = _path[0].position;
         targetCamera.transform.rotation = GetStartRotation();
@@ -493,6 +538,45 @@ public class ReleaseBuildSceneScanner : MonoBehaviour {
         isScanning = false;
         _scanRoutine = null;
         scanProgressText = "Finished";
+
+        onScanCompleted?.Invoke();
+        onScanStopped?.Invoke();
+    }
+    private IEnumerator RunManualScan() {
+        currentPathLabel = "Manual";
+        scanProgress01 = 0f;
+        scanProgressText = "Manual Scan Starting";
+
+        if (warmupSecondsBeforeScan > 0f) {
+            float warmupStart = Time.realtimeSinceStartup;
+
+            while (Time.realtimeSinceStartup - warmupStart < warmupSecondsBeforeScan) {
+                scanProgressText = "Manual Scan Warming Up";
+                TrySampleStats(false);
+                yield return null;
+            }
+        }
+
+        TrySampleStats(true);
+
+        while (isScanning) {
+            currentPathLabel = "Manual";
+
+            if (targetCamera != null) {
+                currentCameraPosition = targetCamera.transform.position;
+                currentCameraEulerAngles = targetCamera.transform.eulerAngles;
+            }
+
+            scanProgressText =
+                "Manual Scan Running | Samples: " +
+                currentSampleIndex +
+                " | Violations: " +
+                currentViolationCount;
+
+            TrySampleStats(false);
+
+            yield return null;
+        }
     }
 
     private Quaternion GetStartRotation() {
@@ -869,6 +953,18 @@ public class ReleaseBuildSceneScanner : MonoBehaviour {
         lastReportPath = path;
 
         Debug.Log("ReleaseBuildSceneScanner report written: " + path, this);
+        if (openRuntimeReportGUIWhenScanCompletes && runtimeReportGUI != null) {
+            runtimeReportGUI.ShowAndLoadReport(path);
+        }
+#if UNITY_EDITOR
+        if (openReportWindowWhenScanCompletes) {
+            UnityEditor.EditorPrefs.SetString("ReleaseBuildSceneScanner.LatestReportPath", path);
+
+            UnityEditor.EditorApplication.delayCall += () => {
+                UnityEditor.EditorApplication.ExecuteMenuItem("Tools/Scene Scanner/Report Viewer");
+            };
+        }
+#endif
     }
 
     private string MakeFileSafe(string value) {
@@ -1030,7 +1126,7 @@ public class ReleaseBuildSceneScanner : MonoBehaviour {
                 DrawPath(previewPath, autoPathGizmoColor, true);
             }
         }
-        else {
+        else if (scanMode == ScanMode.Waypoints) {
             if (drawWaypointPath) {
                 List<PathPoint> previewPath = new List<PathPoint>();
                 BuildWaypointPath(previewPath);
