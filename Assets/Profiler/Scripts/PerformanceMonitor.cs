@@ -1,3 +1,5 @@
+using UnityEngine.Audio;
+using System.Collections.Generic;
 using System.Collections;
 using TMPro;
 using Unity.Profiling;
@@ -126,6 +128,36 @@ public class PerformanceMonitor : MonoBehaviour {
     public Text capsuleCollider2dText;
     public Text compositeCollider2dText;
     public Text other2dColliderText;
+
+    // ─── Canvas Text Fields: Particles ────────────────────────────────────────────
+
+    [Header("PARTICLES")]
+    public Text particleSystemsActiveText;
+    public Text particleSystemsTotalText;
+
+    // ─── Canvas Text Fields: Audio ────────────────────────────────────────────────
+
+    [Header("AUDIO")]
+    public Text audioSourcesActiveText;
+    public Text audioSourcesPlayingText;
+    public Text audioSourcesTotalText;
+    public Text audioClipsLoadedText;
+    public Text audioMixersInUseText;
+    public Text audioMixersLoadedText;
+
+    // ─── Canvas Text Fields: Renderers ────────────────────────────────────────────
+
+    [Header("TRAIL / LINE RENDERERS")]
+    public Text trailRenderersActiveText;
+    public Text trailRenderersTotalText;
+    public Text lineRenderersActiveText;
+    public Text lineRenderersTotalText;
+
+    // ─── Canvas Text Fields: Cameras ──────────────────────────────────────────────
+
+    [Header("CAMERAS")]
+    public Text camerasActiveText;
+    public Text camerasTotalText;
 
     // ─── Profiler Recorders ───────────────────────────────────────────────────
 
@@ -259,6 +291,24 @@ public class PerformanceMonitor : MonoBehaviour {
     string _sCol2dCapsule = "–";
     string _sCol2dComposite = "–";
     string _sCol2dOther = "–";
+
+    string _sParticleSystemsActive = "–";
+    string _sParticleSystemsTotal = "–";
+
+    string _sAudioSourcesActive = "–";
+    string _sAudioSourcesPlaying = "–";
+    string _sAudioSourcesTotal = "–";
+    string _sAudioClipsLoaded = "–";
+    string _sAudioMixersInUse = "–";
+    string _sAudioMixersLoaded = "–";
+
+    string _sTrailRenderersActive = "–";
+    string _sTrailRenderersTotal = "–";
+    string _sLineRenderersActive = "–";
+    string _sLineRenderersTotal = "–";
+
+    string _sCamerasActive = "–";
+    string _sCamerasTotal = "–";
 
     // ─── Internal state ───────────────────────────────────────────────────────
 
@@ -403,7 +453,7 @@ public class PerformanceMonitor : MonoBehaviour {
 
     // ─── Update / LateUpdate ──────────────────────────────────────────────────
 
-    void Update() {
+    public void DoUpdate() {
         if (!_sceneCountRunning)
             StartCoroutine(SceneCountCoroutine());
     }
@@ -752,6 +802,129 @@ public class PerformanceMonitor : MonoBehaviour {
             _sCol2dOther = other.ToString("N0");
         }
 
+        yield return null;
+
+        {
+            int active = 0;
+            int total = 0;
+
+            foreach (ParticleSystem ps in FindSceneObjects<ParticleSystem>()) {
+                if (ps == null || !ps.gameObject.activeInHierarchy)
+                    continue;
+
+                total++;
+
+                if (ps.isPlaying || ps.isEmitting)
+                    active++;
+            }
+
+            _sParticleSystemsActive = active.ToString("N0");
+            _sParticleSystemsTotal = total.ToString("N0");
+        }
+
+        yield return null;
+
+        {
+            int audioSourcesActive = 0;
+            int audioSourcesPlaying = 0;
+            int audioSourcesTotal = 0;
+
+            HashSet<AudioMixer> mixersInUse = new HashSet<AudioMixer>();
+
+            foreach (AudioSource src in FindSceneObjects<AudioSource>()) {
+                if (src == null || !src.gameObject.activeInHierarchy)
+                    continue;
+
+                audioSourcesTotal++;
+
+                if (src.isActiveAndEnabled)
+                    audioSourcesActive++;
+
+                if (src.isPlaying) {
+                    audioSourcesPlaying++;
+
+                    if (src.outputAudioMixerGroup != null && src.outputAudioMixerGroup.audioMixer != null)
+                        mixersInUse.Add(src.outputAudioMixerGroup.audioMixer);
+                }
+            }
+
+            int audioClipsLoaded = 0;
+
+            foreach (AudioClip clip in Resources.FindObjectsOfTypeAll<AudioClip>()) {
+                if (clip != null)
+                    audioClipsLoaded++;
+            }
+
+            int audioMixersLoaded = 0;
+
+            foreach (AudioMixer mixer in Resources.FindObjectsOfTypeAll<AudioMixer>()) {
+                if (mixer != null)
+                    audioMixersLoaded++;
+            }
+
+            _sAudioSourcesActive = audioSourcesActive.ToString("N0");
+            _sAudioSourcesPlaying = audioSourcesPlaying.ToString("N0");
+            _sAudioSourcesTotal = audioSourcesTotal.ToString("N0");
+            _sAudioClipsLoaded = audioClipsLoaded.ToString("N0");
+            _sAudioMixersInUse = mixersInUse.Count.ToString("N0");
+            _sAudioMixersLoaded = audioMixersLoaded.ToString("N0");
+        }
+
+        yield return null;
+
+        {
+            int trailActive = 0;
+            int trailTotal = 0;
+
+            foreach (TrailRenderer tr in FindSceneObjects<TrailRenderer>()) {
+                if (tr == null || !tr.gameObject.activeInHierarchy)
+                    continue;
+
+                trailTotal++;
+
+                if (tr.enabled)
+                    trailActive++;
+            }
+
+            int lineActive = 0;
+            int lineTotal = 0;
+
+            foreach (LineRenderer lr in FindSceneObjects<LineRenderer>()) {
+                if (lr == null || !lr.gameObject.activeInHierarchy)
+                    continue;
+
+                lineTotal++;
+
+                if (lr.enabled)
+                    lineActive++;
+            }
+
+            _sTrailRenderersActive = trailActive.ToString("N0");
+            _sTrailRenderersTotal = trailTotal.ToString("N0");
+            _sLineRenderersActive = lineActive.ToString("N0");
+            _sLineRenderersTotal = lineTotal.ToString("N0");
+        }
+
+        yield return null;
+
+        {
+            int active = 0;
+            int total = 0;
+
+            foreach (Camera cam in FindSceneObjects<Camera>()) {
+                if (cam == null || !cam.gameObject.activeInHierarchy)
+                    continue;
+
+                total++;
+
+                if (cam.isActiveAndEnabled)
+                    active++;
+            }
+
+            _sCamerasActive = active.ToString("N0");
+            _sCamerasTotal = total.ToString("N0");
+        }
+
         yield return new WaitForSecondsRealtime(sceneCountRefreshRate);
         _sceneCountRunning = false;
     }
@@ -840,6 +1013,28 @@ public class PerformanceMonitor : MonoBehaviour {
         SetText(capsuleCollider2dText, "Capsule Collider2D", _sCol2dCapsule);
         SetText(compositeCollider2dText, "Composite Col.2D", _sCol2dComposite);
         SetText(other2dColliderText, "Other 2D Col.", _sCol2dOther);
+
+        // Particles
+        SetText(particleSystemsActiveText, "Particle Systems Active", _sParticleSystemsActive);
+        SetText(particleSystemsTotalText, "Particle Systems Total", _sParticleSystemsTotal);
+
+        // Audio
+        SetText(audioSourcesActiveText, "AudioSources Active", _sAudioSourcesActive);
+        SetText(audioSourcesPlayingText, "AudioSources Playing", _sAudioSourcesPlaying);
+        SetText(audioSourcesTotalText, "AudioSources Total", _sAudioSourcesTotal);
+        SetText(audioClipsLoadedText, "AudioClips Loaded", _sAudioClipsLoaded);
+        SetText(audioMixersInUseText, "AudioMixers In Use", _sAudioMixersInUse);
+        SetText(audioMixersLoadedText, "AudioMixers Loaded", _sAudioMixersLoaded);
+
+        // Trail / Line Renderers
+        SetText(trailRenderersActiveText, "TrailRenderers Active", _sTrailRenderersActive);
+        SetText(trailRenderersTotalText, "TrailRenderers Total", _sTrailRenderersTotal);
+        SetText(lineRenderersActiveText, "LineRenderers Active", _sLineRenderersActive);
+        SetText(lineRenderersTotalText, "LineRenderers Total", _sLineRenderersTotal);
+
+        // Cameras
+        SetText(camerasActiveText, "Cameras Active", _sCamerasActive);
+        SetText(camerasTotalText, "Cameras Total", _sCamerasTotal);
     }
 
     void SetText(Text target, string label, string value, string suffix = "") {

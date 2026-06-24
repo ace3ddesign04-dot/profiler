@@ -27,12 +27,12 @@ public class FPSCounter : MonoBehaviour {
     private AverageWindow[] _windowValues;
 
     [Header("UI Text Fields")]
-    [SerializeField] private Text textCurrentFPS;
-    [SerializeField] private Text textAverageFPS;
-    [SerializeField] private Text textMinFPS;
-    [SerializeField] private Text textMaxFPS;
-    [SerializeField] private Button buttonPause;
-    [SerializeField] private Button buttonReset;
+    [SerializeField] public Text textCurrentFPS;
+    [SerializeField] public Text textAverageFPS;
+    [SerializeField] public Text textMinFPS;
+    [SerializeField] public Text textMaxFPS;
+    [SerializeField] public Button buttonPause;
+    [SerializeField] public Button buttonReset;
 
     [Header("UI Dropdown")]
     [Tooltip("Dropdown for selecting the average window at runtime. Options are populated automatically.")]
@@ -60,7 +60,7 @@ public class FPSCounter : MonoBehaviour {
         InitDropdown();
     }
 
-    private void Update() {
+    public void DoUpdate() {
 
         HandleInput();
         if (!pause) {
