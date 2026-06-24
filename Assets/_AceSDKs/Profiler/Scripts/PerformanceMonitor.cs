@@ -1,7 +1,6 @@
 using UnityEngine.Audio;
 using System.Collections.Generic;
 using System.Collections;
-using TMPro;
 using Unity.Profiling;
 using UnityEngine;
 using UnityEngine.UI;

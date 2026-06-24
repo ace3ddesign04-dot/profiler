@@ -10,7 +10,7 @@ using UnityEngine.SceneManagement;
 using UnityEngine.UI;
 
 /// <summary>
-/// Release-build scene scanner for level/performance profiling.
+/// Scene scanner for level/performance profiling.
 ///
 /// New workflow:
 /// 1. Attach this script to an empty GameObject.
@@ -24,10 +24,8 @@ using UnityEngine.UI;
 /// Application.persistentDataPath / reportFolderName
 ///
 /// Report contains only violated threshold records.
-/// No LINQ.
-/// Uses UnityEngine.UI.Text because your profiler scripts expose Text fields.
 /// </summary>
-public class ReleaseBuildSceneScanner : MonoBehaviour {
+public class SceneScanner : MonoBehaviour {
     public enum ScanMode {
         AutoBounds,
         Waypoints,
@@ -297,7 +295,7 @@ public class ReleaseBuildSceneScanner : MonoBehaviour {
 
     [Header("Report Output")]
     public string reportFolderName = "SceneScanReports";
-    public string reportFilePrefix = Application.productName + "_SceneScan";
+    public string reportFilePrefix = "";
     [TextArea(1, 3)] public string lastReportPath;
 
     [Header("Editor Report Viewer")]
@@ -348,6 +346,8 @@ public class ReleaseBuildSceneScanner : MonoBehaviour {
     private void Awake() {
         if (targetCamera == null)
             targetCamera = Camera.main;
+
+        reportFilePrefix = Application.productName + "_SceneScan";
 
         _initialScannerRotation = targetCamera != null ? targetCamera.transform.rotation : transform.rotation;
 
