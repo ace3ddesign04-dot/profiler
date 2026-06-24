@@ -194,7 +194,7 @@ public class ReleaseBuildSceneScanner : MonoBehaviour {
 
     [Serializable]
     public class ScanReport {
-        public string sceneName;
+        public string project;
         public string mode;
         public string startedAtLocal;
         public string endedAtLocal;
@@ -218,7 +218,7 @@ public class ReleaseBuildSceneScanner : MonoBehaviour {
         public string comparison;
         public float threshold;
         public float value;
-        public string rawText;
+        public string sceneName;
         public float scanTimeSeconds;
         public int frame;
         public Vector3 cameraPosition;
@@ -297,7 +297,7 @@ public class ReleaseBuildSceneScanner : MonoBehaviour {
 
     [Header("Report Output")]
     public string reportFolderName = "SceneScanReports";
-    public string reportFilePrefix = "SceneScan";
+    public string reportFilePrefix = Application.productName + "_SceneScan";
     [TextArea(1, 3)] public string lastReportPath;
 
     [Header("Editor Report Viewer")]
@@ -490,7 +490,7 @@ public class ReleaseBuildSceneScanner : MonoBehaviour {
         onScanStarted?.Invoke();
 
         _activeReport = new ScanReport();
-        _activeReport.sceneName = SceneManager.GetActiveScene().name;
+        _activeReport.project = Application.productName;
         _activeReport.mode = scanMode.ToString();
         _activeReport.startedAtLocal = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture);
         _activeReport.unityVersion = Application.unityVersion;
@@ -858,7 +858,7 @@ public class ReleaseBuildSceneScanner : MonoBehaviour {
         record.comparison = thresholdConfig.comparison.ToString();
         record.threshold = thresholdConfig.threshold;
         record.value = value;
-        record.rawText = rawText;
+        record.sceneName = SceneManager.GetActiveScene().name;
         record.scanTimeSeconds = Time.realtimeSinceStartup - _scanStartRealtime;
         record.frame = Time.frameCount;
         record.cameraPosition = targetCamera.transform.position;
