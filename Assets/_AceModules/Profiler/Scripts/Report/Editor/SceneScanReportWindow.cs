@@ -204,7 +204,6 @@ public class SceneScanReportWindow : EditorWindow {
         EditorGUILayout.LabelField("Report Summary", _headerStyle);
 
         EditorGUILayout.BeginHorizontal();
-        EditorGUILayout.LabelField("Scene", Safe(_report.sceneName));
         EditorGUILayout.LabelField("Mode", Safe(_report.mode));
         EditorGUILayout.EndHorizontal();
 

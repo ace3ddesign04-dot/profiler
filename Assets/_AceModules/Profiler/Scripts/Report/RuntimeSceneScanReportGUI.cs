@@ -2,12 +2,10 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using UnityEngine;
-using UnityEngine.SceneManagement;
 
 public class RuntimeSceneScanReportGUI : MonoBehaviour {
     [Serializable]
     private class ScanReport {
-        public string sceneName;
         public string mode;
         public string startedAtLocal;
         public string endedAtLocal;
@@ -42,7 +40,7 @@ public class RuntimeSceneScanReportGUI : MonoBehaviour {
     [Header("GUI")]
     public bool visible;
     public KeyCode toggleKey = KeyCode.F10;
-    public Rect windowRect = new Rect(30f, 30f, Screen.width, Screen.height);
+    private Rect windowRect = new Rect(0f, 0f, Screen.width, Screen.height);
     public float minWindowWidth = 500f;
     public float minWindowHeight = 350f;
 
@@ -472,7 +470,7 @@ public class RuntimeSceneScanReportGUI : MonoBehaviour {
         GUILayout.Label("Report Summary", _headerStyle);
 
         GUILayout.Label("Loaded File: " + Safe(Path.GetFileName(_loadedReportPath)), _smallLabelStyle);
-        GUILayout.Label("Scene: " + Safe(_report.sceneName) + " | Mode: " + Safe(_report.mode), _smallLabelStyle);
+        GUILayout.Label("Mode: " + Safe(_report.mode), _smallLabelStyle);
         GUILayout.Label("Started: " + Safe(_report.startedAtLocal) + " | Ended: " + Safe(_report.endedAtLocal), _smallLabelStyle);
 
         GUILayout.Label(

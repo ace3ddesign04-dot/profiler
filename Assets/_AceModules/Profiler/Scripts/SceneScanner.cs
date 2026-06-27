@@ -102,7 +102,9 @@ public class SceneScanner : MonoBehaviour {
         Perf_RenderTextures,
         Perf_VideoMemory,
 
-        Perf_TextureCount,
+        Perf_TextureLoaded, 
+        Perf_VisibleMaterialTextures,
+        Perf_VisibleTextureScore,
         Perf_TextureMemory,
         Perf_MeshCount,
         Perf_MeshMemory,
@@ -872,7 +874,6 @@ public class SceneScanner : MonoBehaviour {
         _activeReport.totalViolations = _activeReport.violations.Count;
         currentViolationCount = _activeReport.totalViolations;
     }
-
     private bool TryParseFirstNumberAfterColon(string raw, out float value) {
         value = 0f;
 
@@ -1284,8 +1285,14 @@ public class SceneScanner : MonoBehaviour {
             case StatItem.Perf_VideoMemory:
                 return performanceMonitor != null ? performanceMonitor.videoMemoryText : null;
 
-            case StatItem.Perf_TextureCount:
+            case StatItem.Perf_TextureLoaded:
                 return performanceMonitor != null ? performanceMonitor.textureCountText : null;
+
+            case StatItem.Perf_VisibleMaterialTextures:
+                return performanceMonitor != null ? performanceMonitor.renderedTextureCountText : null;
+
+            case StatItem.Perf_VisibleTextureScore:
+                return performanceMonitor != null ? performanceMonitor.visibleTextureScoreText : null;
 
             case StatItem.Perf_TextureMemory:
                 return performanceMonitor != null ? performanceMonitor.textureMemoryText : null;
@@ -1496,7 +1503,9 @@ public class SceneScanner : MonoBehaviour {
             case StatItem.Perf_RenderTextures: return "Render Textures";
             case StatItem.Perf_VideoMemory: return "Video Memory";
 
-            case StatItem.Perf_TextureCount: return "Texture Count";
+            case StatItem.Perf_TextureLoaded: return "Textures Loaded";
+            case StatItem.Perf_VisibleMaterialTextures: return "Visible Material Textures";
+            case StatItem.Perf_VisibleTextureScore: return "Visible Texture Score";
             case StatItem.Perf_TextureMemory: return "Texture Memory";
             case StatItem.Perf_MeshCount: return "Mesh Count";
             case StatItem.Perf_MeshMemory: return "Mesh Memory";

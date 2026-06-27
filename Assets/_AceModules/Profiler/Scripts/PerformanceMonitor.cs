@@ -22,11 +22,26 @@ using UnityEngine.Profiling;
 /// Project Settings -> Player -> Other Settings -> Rendering -> Frame Timing Stats
 /// </summary>
 public class PerformanceMonitor : MonoBehaviour {
+    private struct VisibleTextureScoreResult {
+        public int uniqueTextureCount;
+        public float textureUnits;
+    }
+
     // ─── Inspector ────────────────────────────────────────────────────────────
 
     [Header("Refresh Rates")]
     public float refreshRate = 0.25f;
     public float sceneCountRefreshRate = 1f;
+
+    [Header("Visible Texture Score")]
+    [Tooltip("One 512x512 texture = 1 texture unit.")]
+    public bool includeMipMapsInVisibleTextureScore = true;
+    [Tooltip("Usually keep false. Material RenderTextures are rare and can distort the score.")]
+    public bool includeRenderTexturesInVisibleTextureScore = false;
+    [Tooltip("Good mobile target. Above this is warning.")]
+    public float visibleTextureScoreWarning = 120f;
+    [Tooltip("Critical mobile target. Above this is bad.")]
+    public float visibleTextureScoreCritical = 180f;
 
     // ─── Canvas Text Fields: Timing ───────────────────────────────────────────
 
@@ -74,6 +89,9 @@ public class PerformanceMonitor : MonoBehaviour {
 
     [Header("ASSETS")]
     public Text textureCountText;
+    public Text renderedTextureCountText;
+    public Text visibleTextureScoreText;
+    public Text visibleTextureScoreStatusText;
     public Text textureMemoryText;
     public Text meshCountText;
     public Text meshMemoryText;
@@ -239,6 +257,9 @@ public class PerformanceMonitor : MonoBehaviour {
     string _sVideoMemory = "–";
 
     string _sTextureCount = "–";
+    string _sRenderedTextureCount = "–";
+    string _sVisibleTextureScore = "–";
+    string _sVisibleTextureScoreStatus = "–";
     string _sTextureMemory = "–";
     string _sMeshCount = "–";
     string _sMeshMemory = "–";
@@ -924,8 +945,142 @@ public class PerformanceMonitor : MonoBehaviour {
             _sCamerasTotal = total.ToString("N0");
         }
 
+        yield return null;
+
+        {
+            VisibleTextureScoreResult textureScore = CalculateVisibleTextureScore();
+
+            _sRenderedTextureCount = textureScore.uniqueTextureCount.ToString("N0");
+            _sVisibleTextureScore = textureScore.textureUnits.ToString("F1");
+
+            if (textureScore.textureUnits >= visibleTextureScoreCritical)
+                _sVisibleTextureScoreStatus = "Critical";
+            else if (textureScore.textureUnits >= visibleTextureScoreWarning)
+                _sVisibleTextureScoreStatus = "Warning";
+            else
+                _sVisibleTextureScoreStatus = "Good";
+        }
+
         yield return new WaitForSecondsRealtime(sceneCountRefreshRate);
         _sceneCountRunning = false;
+    }
+
+    private VisibleTextureScoreResult CalculateVisibleTextureScore() {
+        HashSet<Texture> textures = new HashSet<Texture>();
+
+        Renderer[] renderers = FindSceneObjects<Renderer>();
+
+        for (int i = 0; i < renderers.Length; i++) {
+            Renderer renderer = renderers[i];
+
+            if (renderer == null)
+                continue;
+
+            if (!renderer.enabled)
+                continue;
+
+            if (!renderer.gameObject.activeInHierarchy)
+                continue;
+
+            if (!renderer.isVisible)
+                continue;
+
+            Material[] materials = renderer.sharedMaterials;
+
+            if (materials == null)
+                continue;
+
+            for (int m = 0; m < materials.Length; m++) {
+                Material material = materials[m];
+
+                if (material == null)
+                    continue;
+
+                AddMaterialTextures(material, textures, includeRenderTexturesInVisibleTextureScore);
+            }
+        }
+
+        float totalUnits = 0f;
+
+        foreach (Texture texture in textures) {
+            if (texture == null)
+                continue;
+
+            totalUnits += GetTextureUnitCost(texture, includeMipMapsInVisibleTextureScore);
+        }
+
+        VisibleTextureScoreResult result = new VisibleTextureScoreResult();
+        result.uniqueTextureCount = textures.Count;
+        result.textureUnits = totalUnits;
+        return result;
+    }
+
+    static void AddMaterialTextures(Material material, HashSet<Texture> textures, bool includeRenderTextures) {
+        if (material == null || textures == null)
+            return;
+
+        string[] texturePropertyNames = material.GetTexturePropertyNames();
+
+        if (texturePropertyNames == null)
+            return;
+
+        for (int i = 0; i < texturePropertyNames.Length; i++) {
+            string propertyName = texturePropertyNames[i];
+
+            if (string.IsNullOrEmpty(propertyName))
+                continue;
+
+            Texture texture = material.GetTexture(propertyName);
+
+            if (texture == null)
+                continue;
+
+            if (!includeRenderTextures && texture is RenderTexture)
+                continue;
+
+            textures.Add(texture);
+        }
+    }
+    static float GetTextureUnitCost(Texture texture, bool includeMipMaps) {
+        if (texture == null)
+            return 0f;
+
+        int width = Mathf.Max(1, texture.width);
+        int height = Mathf.Max(1, texture.height);
+
+        float units = (width * height) / (512f * 512f);
+
+        if (includeMipMaps && TextureHasMipMaps(texture))
+            units *= 1.33f;
+
+        return units;
+    }
+
+    static bool TextureHasMipMaps(Texture texture) {
+        if (texture == null)
+            return false;
+
+        Texture2D texture2D = texture as Texture2D;
+        if (texture2D != null)
+            return texture2D.mipmapCount > 1;
+
+        Cubemap cubemap = texture as Cubemap;
+        if (cubemap != null)
+            return cubemap.mipmapCount > 1;
+
+        Texture2DArray texture2DArray = texture as Texture2DArray;
+        if (texture2DArray != null)
+            return texture2DArray.mipmapCount > 1;
+
+        CubemapArray cubemapArray = texture as CubemapArray;
+        if (cubemapArray != null)
+            return cubemapArray.mipmapCount > 1;
+
+        RenderTexture renderTexture = texture as RenderTexture;
+        if (renderTexture != null)
+            return renderTexture.useMipMap;
+
+        return false;
     }
 
     // ─── Canvas Text Update ───────────────────────────────────────────────────
@@ -965,8 +1120,10 @@ public class PerformanceMonitor : MonoBehaviour {
         SetText(renderTexturesText, "Render Textures", _sRenderTextures, " MB");
         SetText(videoMemoryText, "Video Memory", _sVideoMemory, " MB");
 
-        // Assets
-        SetText(textureCountText, "Textures", _sTextureCount);
+        SetText(textureCountText, "Textures Loaded", _sTextureCount);
+        SetText(renderedTextureCountText, "Visible Material Textures", _sRenderedTextureCount);
+        SetText(visibleTextureScoreText, "Visible Texture Score", _sVisibleTextureScore, " units");
+        SetText(visibleTextureScoreStatusText, "Visible Texture Status", _sVisibleTextureScoreStatus);
         SetText(textureMemoryText, "Texture Memory", _sTextureMemory, " MB");
         SetText(meshCountText, "Meshes", _sMeshCount);
         SetText(meshMemoryText, "Mesh Memory", _sMeshMemory, " MB");
