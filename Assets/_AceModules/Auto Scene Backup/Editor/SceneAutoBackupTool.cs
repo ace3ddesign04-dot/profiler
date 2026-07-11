@@ -476,6 +476,7 @@ public static class SceneAutoBackupManager {
 
 public class SceneAutoBackupWindow : EditorWindow {
 
+    private Vector2 mainScrollPosition;
     private Vector2 trackedScenesScrollPosition;
     private Vector2 backupFilesScrollPosition;
 
@@ -507,6 +508,10 @@ public class SceneAutoBackupWindow : EditorWindow {
         SceneAutoBackupSettings settings =
             SceneAutoBackupSettings.instance;
 
+        mainScrollPosition =
+            EditorGUILayout.BeginScrollView(
+                mainScrollPosition);
+
         EditorGUILayout.Space(8f);
 
         EditorGUILayout.LabelField(
@@ -514,9 +519,9 @@ public class SceneAutoBackupWindow : EditorWindow {
             EditorStyles.boldLabel);
 
         EditorGUILayout.HelpBox(
-            "Tracked scenes are backed up whenever they are " +
-            "saved. Dirty tracked scenes can also be saved " +
-            "automatically at the selected interval.",
+            "Tracked scenes are backed up whenever they are saved. " +
+            "Dirty tracked scenes can also be saved automatically " +
+            "at the selected interval.",
             MessageType.Info);
 
         EditorGUILayout.Space(5f);
@@ -539,7 +544,9 @@ public class SceneAutoBackupWindow : EditorWindow {
 
         DrawRestoreSection(settings);
 
-        EditorGUILayout.Space(10f);
+        EditorGUILayout.Space(20f);
+
+        EditorGUILayout.EndScrollView();
     }
 
     private void DrawGeneralSettings(
@@ -664,7 +671,7 @@ public class SceneAutoBackupWindow : EditorWindow {
     }
 
     private void DrawTrackedScenes(
-        SceneAutoBackupSettings settings) {
+    SceneAutoBackupSettings settings) {
 
         EditorGUILayout.BeginHorizontal();
 
@@ -687,6 +694,8 @@ public class SceneAutoBackupWindow : EditorWindow {
         }
 
         EditorGUILayout.EndHorizontal();
+
+        DrawSceneDropArea(settings);
 
         trackedScenesScrollPosition =
             EditorGUILayout.BeginScrollView(
@@ -740,12 +749,106 @@ public class SceneAutoBackupWindow : EditorWindow {
 
         if (guids.Count == 0) {
             EditorGUILayout.HelpBox(
-                "No scenes are currently tracked. Open and save " +
-                "the required scenes, then press Add Open Scenes.",
+                "No scenes are currently tracked. Add open scenes " +
+                "or drag scene assets into the area above.",
                 MessageType.Warning);
         }
 
         EditorGUILayout.EndScrollView();
+    }
+    private static void DrawSceneDropArea(
+    SceneAutoBackupSettings settings) {
+
+        Rect dropArea =
+            GUILayoutUtility.GetRect(
+                0f,
+                55f,
+                GUILayout.ExpandWidth(true));
+
+        GUI.Box(
+            dropArea,
+            "Drag and Drop Scene Assets Here",
+            EditorStyles.helpBox);
+
+        Event currentEvent = Event.current;
+
+        if (!dropArea.Contains(
+                currentEvent.mousePosition)) {
+            return;
+        }
+
+        if (currentEvent.type == EventType.DragUpdated) {
+            DragAndDrop.visualMode =
+                ContainsValidSceneAsset(
+                    DragAndDrop.objectReferences)
+                    ? DragAndDropVisualMode.Copy
+                    : DragAndDropVisualMode.Rejected;
+
+            currentEvent.Use();
+            return;
+        }
+
+        if (currentEvent.type != EventType.DragPerform) {
+            return;
+        }
+
+        DragAndDrop.AcceptDrag();
+
+        int addedCount = 0;
+
+        foreach (UnityEngine.Object draggedObject
+                 in DragAndDrop.objectReferences) {
+
+            if (!(draggedObject is SceneAsset)) {
+                continue;
+            }
+
+            string scenePath =
+                AssetDatabase.GetAssetPath(
+                    draggedObject);
+
+            if (string.IsNullOrEmpty(scenePath) ||
+                !scenePath.EndsWith(
+                    ".unity",
+                    StringComparison.OrdinalIgnoreCase)) {
+                continue;
+            }
+
+            bool alreadyTracked =
+                settings.IsSceneTracked(scenePath);
+
+            settings.AddScene(scenePath);
+
+            if (!alreadyTracked) {
+                addedCount++;
+            }
+        }
+
+        if (addedCount > 0) {
+            Debug.Log(
+                $"Scene Auto Backup: Added {addedCount} " +
+                $"scene(s) using drag and drop.");
+        }
+
+        currentEvent.Use();
+    }
+    private static bool ContainsValidSceneAsset(
+    UnityEngine.Object[] draggedObjects) {
+
+        if (draggedObjects == null ||
+            draggedObjects.Length == 0) {
+            return false;
+        }
+
+        foreach (UnityEngine.Object draggedObject
+                 in draggedObjects) {
+
+            if (draggedObject is SceneAsset) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private void DrawManualBackupSection(
