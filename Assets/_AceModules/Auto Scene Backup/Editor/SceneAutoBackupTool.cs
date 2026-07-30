@@ -9,10 +9,11 @@ using UnityEngine.SceneManagement;
 [FilePath(
     "ProjectSettings/SceneAutoBackupSettings.asset",
     FilePathAttribute.Location.ProjectFolder)]
-public class SceneAutoBackupSettings :
+public class SceneAutoBackupSettings : 
     ScriptableSingleton<SceneAutoBackupSettings> {
 
     [SerializeField] private bool backupsEnabled = true;
+    [SerializeField] private bool backupOnManualSave = true;
     [SerializeField] private bool automaticSceneSaving = true;
     [SerializeField] private string backupLocation = "";
     [SerializeField] private float backupIntervalMinutes = 5f;
@@ -34,7 +35,13 @@ public class SceneAutoBackupSettings :
             SaveSettings();
         }
     }
-
+    public bool BackupOnManualSave {
+        get => backupOnManualSave;
+        set {
+            backupOnManualSave = value;
+            SaveSettings();
+        }
+    }
     public string BackupLocation {
         get => backupLocation;
         set {
@@ -212,7 +219,8 @@ public static class SceneAutoBackupManager {
         SceneAutoBackupSettings settings =
             SceneAutoBackupSettings.instance;
 
-        if (!settings.BackupsEnabled) {
+        if (!settings.BackupsEnabled ||
+            !settings.BackupOnManualSave) {
             return;
         }
 
@@ -550,7 +558,7 @@ public class SceneAutoBackupWindow : EditorWindow {
     }
 
     private void DrawGeneralSettings(
-        SceneAutoBackupSettings settings) {
+    SceneAutoBackupSettings settings) {
 
         EditorGUILayout.LabelField(
             "Settings",
@@ -568,6 +576,11 @@ public class SceneAutoBackupWindow : EditorWindow {
                 "Automatic Scene Saving",
                 settings.AutomaticSceneSaving);
 
+        bool backupOnManualSave =
+            EditorGUILayout.Toggle(
+                "Backup On Ctrl + S",
+                settings.BackupOnManualSave);
+
         float interval =
             EditorGUILayout.FloatField(
                 "Save Interval (Minutes)",
@@ -582,8 +595,14 @@ public class SceneAutoBackupWindow : EditorWindow {
             return;
         }
 
-        settings.BackupsEnabled = backupsEnabled;
-        settings.AutomaticSceneSaving = automaticSaving;
+        settings.BackupsEnabled =
+            backupsEnabled;
+
+        settings.AutomaticSceneSaving =
+            automaticSaving;
+
+        settings.BackupOnManualSave =
+            backupOnManualSave;
 
         settings.BackupIntervalMinutes =
             Mathf.Max(1f, interval);
