@@ -1,0 +1,1 @@
+Whichever render pipeline you are using, you can update the materials from the top menu bar Tools > Convert Materials.

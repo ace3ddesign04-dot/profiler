@@ -129,7 +129,7 @@ MonoBehaviour:
   coveredColor: {r: 1, g: 1, b: 1, a: 1}
   revealedColor: {r: 0.75, g: 0.75, b: 0.75, a: 1}
   flaggedColor: {r: 0.9, g: 0.65, b: 0.15, a: 1}
-  mineColor: {r: 0.15, g: 0.15, b: 0.15, a: 1}
+  mineColor: {r: 1, g: 0, b: 0.7398772, a: 1}
   explodedMineColor: {r: 0.9, g: 0.1, b: 0.1, a: 1}
 --- !u!1 &3562652358302968778
 GameObject:
