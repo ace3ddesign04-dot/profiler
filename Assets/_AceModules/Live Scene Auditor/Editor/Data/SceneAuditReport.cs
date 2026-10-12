@@ -88,6 +88,19 @@ namespace AceModules.LiveSceneAuditor
     }
 
     [Serializable]
+    public class TextureSizeBucket
+    {
+        public string resolution;
+        public int width;
+        public int height;
+        public int count;
+        public float totalScore;
+        public float percentageOfTotal;
+        public List<string> textureNames = new List<string>();
+        public List<int> textureInstanceIds = new List<int>();
+    }
+
+    [Serializable]
     public class SceneAuditReport
     {
         public DateTime scanTimestamp = DateTime.Now;
@@ -105,6 +118,8 @@ namespace AceModules.LiveSceneAuditor
 
         // Texture & Model Metrics
         public float textureAreaScore = 0f;
+        public int totalTexturesCount = 0;
+        public List<TextureSizeBucket> textureSizeBreakdown = new List<TextureSizeBucket>();
         public int fbxModelCount = 0;
 
         // Lighting Metrics

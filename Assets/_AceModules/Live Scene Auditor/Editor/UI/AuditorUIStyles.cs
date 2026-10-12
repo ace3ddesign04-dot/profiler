@@ -191,10 +191,21 @@ namespace AceModules.LiveSceneAuditor
             else percentText = $"{Mathf.Round(ratio * 100f):N0}%";
 
             Color barColor = ColorGood;
-            if (ratio >= 1.0f)
+            string statusSuffix = "";
+            if (ratio > 1.0f)
+            {
                 barColor = ColorDanger;
-            else if (ratio >= 0.75f)
+                statusSuffix = " • Over Budget";
+            }
+            else if (ratio >= 1.0f)
+            {
                 barColor = ColorWarning;
+                statusSuffix = " • Fully Used";
+            }
+            else if (ratio >= 0.75f)
+            {
+                barColor = ColorWarning;
+            }
 
             EditorGUILayout.BeginVertical();
             
@@ -202,10 +213,10 @@ namespace AceModules.LiveSceneAuditor
             EditorGUILayout.BeginHorizontal();
             EditorGUILayout.LabelField(label, EditorStyles.boldLabel, GUILayout.Width(160));
             
-            string valueText = $"{animCurrent:N0} / {max:N0} {unit} ({percentText})";
+            string valueText = $"{animCurrent:N0} / {max:N0} {unit} ({percentText}{statusSuffix})";
             if (current % 1 != 0 || animCurrent % 1 != 0)
             {
-                valueText = $"{animCurrent:F1} / {max:F1} {unit} ({percentText})";
+                valueText = $"{animCurrent:F1} / {max:F1} {unit} ({percentText}{statusSuffix})";
             }
 
             GUIStyle coloredValueStyle = new GUIStyle(MetricValue);

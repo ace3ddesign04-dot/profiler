@@ -106,10 +106,28 @@ namespace AceModules.LiveSceneAuditor
 
         public static SceneAuditReport CurrentReport { get; private set; }
         public static bool IsScanning { get; private set; }
+        private static double _scanStartTime = 0;
         
         public static float BackgroundIntervalTimer = 10f;
         public static float BackgroundChangeDebounceTimer = -1f;
-        public const float ChangeDebounceDuration = 0.8f;
+        public const float ChangeDebounceDuration = 0.35f;
+
+        public static void SetScanning(bool scanning)
+        {
+            IsScanning = scanning;
+            if (scanning) _scanStartTime = EditorApplication.timeSinceStartup;
+        }
+
+        public static void CheckScanWatchdog()
+        {
+            if (IsScanning && (EditorApplication.timeSinceStartup - _scanStartTime > 3.5))
+            {
+                Debug.LogWarning("[Live Scene Auditor] Async scan watchdog timeout - recovering scanning state.");
+                IsScanning = false;
+                SceneScanEngine.CancelCurrentScan();
+                SceneView.RepaintAll();
+            }
+        }
 
         private Vector2 _scrollPos;
         private int _culpritSubFilter = 0;
@@ -130,6 +148,8 @@ namespace AceModules.LiveSceneAuditor
         private bool _viewSortAscending = false;
         private readonly HashSet<int> _expandedViewpoints = new HashSet<int>();
         private readonly HashSet<string> _expandedSections = new HashSet<string>();
+        private readonly HashSet<string> _expandedTextureSizes = new HashSet<string>();
+        private bool _expandAllTextureSizes = false;
 
         // Atlasing sorting state
         private enum AtlasScopeFilter { EntireScene, CurrentView }
@@ -282,6 +302,8 @@ namespace AceModules.LiveSceneAuditor
 
         private void Update()
         {
+            CheckScanWatchdog();
+
             if (SyncWithSceneView && SceneView.lastActiveSceneView != null)
             {
                 SyncCameraNow(SceneView.lastActiveSceneView);
@@ -562,12 +584,134 @@ namespace AceModules.LiveSceneAuditor
 
             // Category 3: Texture Memory & Score
             EditorGUILayout.BeginVertical(AuditorUIStyles.CardBox);
+            EditorGUILayout.BeginHorizontal();
             EditorGUILayout.LabelField("🖼️ Textures & Asset Footprint", AuditorUIStyles.CardHeader);
+            GUILayout.FlexibleSpace();
+            AuditorUIStyles.DrawBadge($"{CurrentReport.totalTexturesCount} Unique Textures", AuditorUIStyles.ColorCardBg, Color.white);
+            EditorGUILayout.EndHorizontal();
             EditorGUILayout.Space(4);
 
             AuditorUIStyles.DrawBudgetProgressBar("Texture Area Score", CurrentReport.textureAreaScore, _activeProfile.maxTextureScore, "pts");
-            
             EditorGUILayout.HelpBox("Base score standard: 512x512 = 1.0 pt | 1024x1024 = 4.0 pts | 2048x2048 = 16.0 pts", MessageType.None);
+
+            // Texture Count with respect to Size Breakdown
+            EditorGUILayout.Space(6);
+            EditorGUILayout.BeginHorizontal();
+            EditorGUILayout.LabelField("📏 Texture Count by Resolution / Size", EditorStyles.boldLabel);
+            GUILayout.FlexibleSpace();
+            if (CurrentReport.textureSizeBreakdown != null && CurrentReport.textureSizeBreakdown.Count > 0)
+            {
+                if (GUILayout.Button(_expandAllTextureSizes ? "Collapse All Sizes" : "Expand All Sizes", EditorStyles.miniButton, GUILayout.Width(115), GUILayout.Height(18)))
+                {
+                    _expandAllTextureSizes = !_expandAllTextureSizes;
+                    _expandedTextureSizes.Clear();
+                    if (_expandAllTextureSizes)
+                    {
+                        foreach (var b in CurrentReport.textureSizeBreakdown)
+                            _expandedTextureSizes.Add(b.resolution);
+                    }
+                }
+            }
+            EditorGUILayout.EndHorizontal();
+            EditorGUILayout.Space(4);
+
+            if (CurrentReport.textureSizeBreakdown == null || CurrentReport.textureSizeBreakdown.Count == 0)
+            {
+                EditorGUILayout.LabelField("No texture assets active in scene.", AuditorUIStyles.SubtleText);
+            }
+            else
+            {
+                // Quick horizontal chip strip of texture sizes
+                EditorGUILayout.BeginHorizontal();
+                int chipsShown = 0;
+                foreach (var bucket in CurrentReport.textureSizeBreakdown)
+                {
+                    Color chipColor = (bucket.width >= 4096 || bucket.height >= 4096)
+                        ? AuditorUIStyles.ColorDanger
+                        : ((bucket.width >= 2048 || bucket.height >= 2048)
+                            ? AuditorUIStyles.ColorWarning
+                            : AuditorUIStyles.ColorCardBg);
+
+                    AuditorUIStyles.DrawBadge($"{bucket.resolution}: {bucket.count}", chipColor * (chipColor == AuditorUIStyles.ColorCardBg ? 1f : 0.45f), Color.white);
+                    GUILayout.Space(3);
+                    chipsShown++;
+                    if (chipsShown % 6 == 0 && chipsShown < CurrentReport.textureSizeBreakdown.Count)
+                    {
+                        EditorGUILayout.EndHorizontal();
+                        EditorGUILayout.Space(2);
+                        EditorGUILayout.BeginHorizontal();
+                    }
+                }
+                EditorGUILayout.EndHorizontal();
+                EditorGUILayout.Space(6);
+
+                // Detailed expandable cards for each resolution
+                foreach (var bucket in CurrentReport.textureSizeBreakdown)
+                {
+                    bool isExpanded = _expandedTextureSizes.Contains(bucket.resolution);
+                    EditorGUILayout.BeginVertical(EditorStyles.helpBox);
+
+                    EditorGUILayout.BeginHorizontal();
+                    string foldIcon = isExpanded ? "▼ " : "▶ ";
+                    if (GUILayout.Button(new GUIContent($"{foldIcon}{bucket.resolution}", "Click to expand/collapse texture assets list"), EditorStyles.boldLabel, GUILayout.Width(130)))
+                    {
+                        if (isExpanded) _expandedTextureSizes.Remove(bucket.resolution);
+                        else _expandedTextureSizes.Add(bucket.resolution);
+                    }
+
+                    Color badgeCol = (bucket.width >= 4096 || bucket.height >= 4096)
+                        ? AuditorUIStyles.ColorDanger
+                        : ((bucket.width >= 2048 || bucket.height >= 2048)
+                            ? AuditorUIStyles.ColorWarning
+                            : AuditorUIStyles.ColorGood);
+
+                    AuditorUIStyles.DrawBadge($"{bucket.count} {(bucket.count == 1 ? "Texture" : "Textures")}", badgeCol * 0.4f, Color.white);
+                    GUILayout.Space(4);
+                    AuditorUIStyles.DrawBadge($"{bucket.percentageOfTotal:F1}% of Total", AuditorUIStyles.ColorCardBg, Color.white);
+                    GUILayout.Space(4);
+                    AuditorUIStyles.DrawBadge($"{bucket.totalScore:F1} pts Score", AuditorUIStyles.ColorCardBg, Color.white);
+
+                    GUILayout.FlexibleSpace();
+                    if (GUILayout.Button(isExpanded ? "Collapse" : "View Assets", EditorStyles.miniButton, GUILayout.Width(80), GUILayout.Height(18)))
+                    {
+                        if (isExpanded) _expandedTextureSizes.Remove(bucket.resolution);
+                        else _expandedTextureSizes.Add(bucket.resolution);
+                    }
+                    EditorGUILayout.EndHorizontal();
+
+                    if (isExpanded)
+                    {
+                        EditorGUILayout.Space(3);
+                        EditorGUI.indentLevel++;
+                        for (int tIdx = 0; tIdx < bucket.textureNames.Count; tIdx++)
+                        {
+                            string tName = bucket.textureNames[tIdx];
+                            int tId = tIdx < bucket.textureInstanceIds.Count ? bucket.textureInstanceIds[tIdx] : 0;
+
+                            EditorGUILayout.BeginHorizontal();
+                            EditorGUILayout.LabelField($"🖼️ {tName}", EditorStyles.miniLabel, GUILayout.ExpandWidth(true));
+
+                            GUI.enabled = tId != 0;
+                            if (GUILayout.Button("Ping", EditorStyles.miniButton, GUILayout.Width(50), GUILayout.Height(16)))
+                            {
+                                var texObj = EditorUtility.InstanceIDToObject(tId);
+                                if (texObj != null)
+                                {
+                                    EditorGUIUtility.PingObject(texObj);
+                                    Selection.activeObject = texObj;
+                                }
+                            }
+                            GUI.enabled = true;
+                            EditorGUILayout.EndHorizontal();
+                        }
+                        EditorGUI.indentLevel--;
+                        EditorGUILayout.Space(2);
+                    }
+
+                    EditorGUILayout.EndVertical();
+                }
+            }
+
             EditorGUILayout.EndVertical();
 
             // Category 4: Lighting & Shadow Budgets
@@ -1967,15 +2111,28 @@ namespace AceModules.LiveSceneAuditor
 
         private void DrawSettingsTab()
         {
+            float prevLabelWidth = EditorGUIUtility.labelWidth;
+            // Dynamically allocate ample label width so no setting text trims before its input field
+            float targetLabelWidth = 260f;
+            if (position.width > 550f)
+            {
+                targetLabelWidth = Mathf.Min(340f, position.width * 0.45f);
+            }
+            else if (position.width > 0f && position.width < 360f)
+            {
+                targetLabelWidth = Mathf.Max(200f, position.width - 80f);
+            }
+            EditorGUIUtility.labelWidth = targetLabelWidth;
+
             EditorGUILayout.BeginVertical(AuditorUIStyles.CardBox);
             EditorGUILayout.LabelField("⚙️ Audit Configuration & Limits", AuditorUIStyles.CardHeader);
             EditorGUILayout.Space(6);
 
-            UseAsyncScan = EditorGUILayout.Toggle("Async (Background Thread)", UseAsyncScan);
-            ScanIntervalSeconds = EditorGUILayout.Slider("Scan Interval (sec)", ScanIntervalSeconds, 3f, 60f);
+            UseAsyncScan = EditorGUILayout.Toggle(new GUIContent("Async (Background Thread)", "Runs calculations on background worker thread to prevent editor UI freeze"), UseAsyncScan);
+            ScanIntervalSeconds = EditorGUILayout.Slider(new GUIContent("Scan Interval (sec)", "Interval in seconds between automated background scans"), ScanIntervalSeconds, 3f, 60f);
             
             EditorGUI.BeginChangeCheck();
-            bool newInact = EditorGUILayout.Toggle("Include Inactive Objects", IncludeInactive);
+            bool newInact = EditorGUILayout.Toggle(new GUIContent("Include Inactive Objects", "Audit inactive and disabled GameObjects in the scene"), IncludeInactive);
             if (EditorGUI.EndChangeCheck())
             {
                 IncludeInactive = newInact;
@@ -1985,37 +2142,37 @@ namespace AceModules.LiveSceneAuditor
             EditorGUILayout.Space(8);
             EditorGUILayout.LabelField("Camera Configuration", EditorStyles.boldLabel);
             EditorGUI.indentLevel++;
-            CustomCamera = (Camera)EditorGUILayout.ObjectField("Target Game Camera", CustomCamera, typeof(Camera), true);
-            SyncWithSceneView = EditorGUILayout.Toggle("Sync with Scene View", SyncWithSceneView);
+            CustomCamera = (Camera)EditorGUILayout.ObjectField(new GUIContent("Target Game Camera", "Camera used to compute frustum visibility audits"), CustomCamera, typeof(Camera), true);
+            SyncWithSceneView = EditorGUILayout.Toggle(new GUIContent("Sync with Scene View", "Aligns Game Camera transform to Scene View during editor navigation"), SyncWithSceneView);
             EditorGUI.indentLevel--;
 
             EditorGUILayout.Space(8);
             EditorGUILayout.LabelField("Performance Budgets", EditorStyles.boldLabel);
             EditorGUI.BeginChangeCheck();
             EditorGUI.indentLevel++;
-            _activeProfile.maxTriangles = EditorGUILayout.IntField("Max Visible Tris", _activeProfile.maxTriangles);
-            _activeProfile.maxVertices = EditorGUILayout.IntField("Max Visible Verts", _activeProfile.maxVertices);
-            _activeProfile.maxMaterialsInScene = EditorGUILayout.IntField("Max Materials", _activeProfile.maxMaterialsInScene);
-            _activeProfile.maxTextureScore = EditorGUILayout.FloatField("Max Texture Score", _activeProfile.maxTextureScore);
-            _activeProfile.maxFbxInScene = EditorGUILayout.IntField("Max Scene FBXs", _activeProfile.maxFbxInScene);
+            _activeProfile.maxTriangles = EditorGUILayout.IntField(new GUIContent("Max Visible Tris", "Maximum visible triangle count budget"), _activeProfile.maxTriangles);
+            _activeProfile.maxVertices = EditorGUILayout.IntField(new GUIContent("Max Visible Verts", "Maximum visible vertex count budget"), _activeProfile.maxVertices);
+            _activeProfile.maxMaterialsInScene = EditorGUILayout.IntField(new GUIContent("Max Materials", "Maximum unique material assets allowed across scene"), _activeProfile.maxMaterialsInScene);
+            _activeProfile.maxTextureScore = EditorGUILayout.FloatField(new GUIContent("Max Texture Score", "Maximum accumulated texture area score budget"), _activeProfile.maxTextureScore);
+            _activeProfile.maxFbxInScene = EditorGUILayout.IntField(new GUIContent("Max Scene FBXs", "Maximum unique 3D model FBX assets allowed"), _activeProfile.maxFbxInScene);
             EditorGUI.indentLevel--;
 
             EditorGUILayout.Space(8);
             EditorGUILayout.LabelField("Lighting Budgets", EditorStyles.boldLabel);
             EditorGUI.indentLevel++;
-            _activeProfile.maxDirectionalLights = EditorGUILayout.IntField("Max Directional Lights", _activeProfile.maxDirectionalLights);
-            _activeProfile.maxPointLights = EditorGUILayout.IntField("Max Point Lights", _activeProfile.maxPointLights);
-            _activeProfile.maxSpotLights = EditorGUILayout.IntField("Max Spot Lights", _activeProfile.maxSpotLights);
-            _activeProfile.maxTotalLights = EditorGUILayout.IntField("Max Total Lights", _activeProfile.maxTotalLights);
-            _activeProfile.maxRealtimeShadowCasters = EditorGUILayout.IntField("Max Realtime Shadow Casters", _activeProfile.maxRealtimeShadowCasters);
+            _activeProfile.maxDirectionalLights = EditorGUILayout.IntField(new GUIContent("Max Directional Lights", "Maximum directional lights allowed in scene"), _activeProfile.maxDirectionalLights);
+            _activeProfile.maxPointLights = EditorGUILayout.IntField(new GUIContent("Max Point Lights", "Maximum point lights allowed in scene"), _activeProfile.maxPointLights);
+            _activeProfile.maxSpotLights = EditorGUILayout.IntField(new GUIContent("Max Spot Lights", "Maximum spot lights allowed in scene"), _activeProfile.maxSpotLights);
+            _activeProfile.maxTotalLights = EditorGUILayout.IntField(new GUIContent("Max Total Lights", "Maximum total active lights allowed in scene"), _activeProfile.maxTotalLights);
+            _activeProfile.maxRealtimeShadowCasters = EditorGUILayout.IntField(new GUIContent("Max Realtime Shadow Casters", "Maximum realtime lights casting dynamic shadows"), _activeProfile.maxRealtimeShadowCasters);
             EditorGUI.indentLevel--;
 
             EditorGUILayout.Space(8);
             EditorGUILayout.LabelField("Single Object Culprit Thresholds", EditorStyles.boldLabel);
             EditorGUI.indentLevel++;
-            _activeProfile.singleMeshHeavyTriangles = EditorGUILayout.IntField("Heavy Mesh Threshold (Tris)", _activeProfile.singleMeshHeavyTriangles);
-            _activeProfile.maxMaterialsPerObject = EditorGUILayout.IntField("Max Materials Per Object", _activeProfile.maxMaterialsPerObject);
-            _activeProfile.requireLodAboveTriangles = EditorGUILayout.IntField("Require LOD If Above (Tris)", _activeProfile.requireLodAboveTriangles);
+            _activeProfile.singleMeshHeavyTriangles = EditorGUILayout.IntField(new GUIContent("Heavy Mesh Threshold (Tris)", "Meshes exceeding this triangle count will be flagged as heavy culprits"), _activeProfile.singleMeshHeavyTriangles);
+            _activeProfile.maxMaterialsPerObject = EditorGUILayout.IntField(new GUIContent("Max Materials Per Object", "Meshes with more unique sub-materials than this limit trigger multi-material warnings"), _activeProfile.maxMaterialsPerObject);
+            _activeProfile.requireLodAboveTriangles = EditorGUILayout.IntField(new GUIContent("Require LOD If Above (Tris)", "Meshes exceeding this polycount without a LODGroup are flagged"), _activeProfile.requireLodAboveTriangles);
             EditorGUI.indentLevel--;
             if (EditorGUI.EndChangeCheck())
             {
@@ -2026,7 +2183,7 @@ namespace AceModules.LiveSceneAuditor
             EditorGUILayout.LabelField("Auditor View Display Limits", EditorStyles.boldLabel);
             EditorGUI.indentLevel++;
             EditorGUI.BeginChangeCheck();
-            int newDispLimit = EditorGUILayout.IntField("Max Culprits Displayed", CulpritDisplayLimit);
+            int newDispLimit = EditorGUILayout.IntField(new GUIContent("Max Culprits Displayed", "Maximum culprit items to render in list"), CulpritDisplayLimit);
             if (EditorGUI.EndChangeCheck())
             {
                 CulpritDisplayLimit = newDispLimit;
@@ -2066,6 +2223,7 @@ namespace AceModules.LiveSceneAuditor
                     _auditViewpoints.RemoveAt(i);
                     SaveViewpointPaths();
                     TriggerScan(AutoScope == ScanScope.EntireScene);
+                    EditorGUIUtility.labelWidth = prevLabelWidth;
                     GUIUtility.ExitGUI();
                     break;
                 }
@@ -2113,6 +2271,7 @@ namespace AceModules.LiveSceneAuditor
             }
 
             EditorGUILayout.EndVertical();
+            EditorGUIUtility.labelWidth = prevLabelWidth;
         }
 
         private void DrawFooter()
@@ -2215,12 +2374,16 @@ namespace AceModules.LiveSceneAuditor
         public void TriggerScan(bool fullScene)
         {
             BackgroundIntervalTimer = ScanIntervalSeconds;
-            IsScanning = true;
+            SetScanning(true);
 
             Camera targetCam = GetTargetGameCamera();
             if (SyncWithSceneView && SceneView.lastActiveSceneView != null)
             {
                 SyncCameraNow(SceneView.lastActiveSceneView);
+            }
+            if (targetCam == null && SceneView.lastActiveSceneView != null)
+            {
+                targetCam = SceneView.lastActiveSceneView.camera;
             }
 
             List<Transform> validVps = GetValidViewpoints();
@@ -2234,7 +2397,7 @@ namespace AceModules.LiveSceneAuditor
                 onCompleted: (report) =>
                 {
                     CurrentReport = report;
-                    IsScanning = false;
+                    SetScanning(false);
                     Repaint();
                     SceneView.RepaintAll();
                 },
@@ -2251,12 +2414,16 @@ namespace AceModules.LiveSceneAuditor
             }
             else
             {
-                IsScanning = true;
+                SetScanning(true);
                 BackgroundIntervalTimer = ScanIntervalSeconds;
                 Camera targetCam = GetTargetGameCamera();
                 if (SyncWithSceneView && SceneView.lastActiveSceneView != null)
                 {
                     SyncCameraNow(SceneView.lastActiveSceneView);
+                }
+                if (targetCam == null && SceneView.lastActiveSceneView != null)
+                {
+                    targetCam = SceneView.lastActiveSceneView.camera;
                 }
 
                 List<Transform> validVps = GetValidViewpoints();
@@ -2270,7 +2437,7 @@ namespace AceModules.LiveSceneAuditor
                     onCompleted: (report) =>
                     {
                         CurrentReport = report;
-                        IsScanning = false;
+                        SetScanning(false);
                         SceneView.RepaintAll();
                     },
                     viewpoints: validVps

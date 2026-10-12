@@ -81,10 +81,11 @@ namespace AceModules.LiveSceneAuditor
             {
                 File.WriteAllText(tempHtmlPath, html, Encoding.UTF8);
 
+                string fileUrl = new Uri(tempHtmlPath).AbsoluteUri;
                 ProcessStartInfo psi = new ProcessStartInfo
                 {
                     FileName = browserPath,
-                    Arguments = $"--headless --disable-gpu --no-pdf-header-footer --print-to-pdf=\"{targetPdfPath}\" \"{tempHtmlPath}\"",
+                    Arguments = $"--headless --disable-gpu --no-sandbox --disable-dev-shm-usage --no-pdf-header-footer --print-to-pdf=\"{targetPdfPath}\" \"{fileUrl}\"",
                     UseShellExecute = false,
                     CreateNoWindow = true,
                     RedirectStandardOutput = true,
@@ -93,6 +94,10 @@ namespace AceModules.LiveSceneAuditor
 
                 using Process proc = Process.Start(psi);
                 if (proc == null) return false;
+
+                // Drain output/error streams asynchronously to avoid pipe buffer deadlocks on macOS/Unix/Mono
+                proc.BeginOutputReadLine();
+                proc.BeginErrorReadLine();
 
                 bool exited = proc.WaitForExit(15000); // 15s timeout
                 if (!exited)
@@ -120,41 +125,87 @@ namespace AceModules.LiveSceneAuditor
 
         private static string FindBrowserExecutablePath()
         {
-            // 1. Standard Microsoft Edge locations (Pre-installed on every Windows 10/11 system)
-            string edgeX86 = @"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe";
-            if (File.Exists(edgeX86)) return edgeX86;
-
-            string edge64 = @"C:\Program Files\Microsoft\Edge\Application\msedge.exe";
-            if (File.Exists(edge64)) return edge64;
-
-            // 2. Google Chrome locations
-            string chrome64 = @"C:\Program Files\Google\Chrome\Application\chrome.exe";
-            if (File.Exists(chrome64)) return chrome64;
-
-            string chromeX86 = @"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe";
-            if (File.Exists(chromeX86)) return chromeX86;
-
-            // 3. User Local AppData installations
-            string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-            if (!string.IsNullOrEmpty(localAppData))
+            // 1. macOS application bundles (Standard Chrome, Edge, Chromium, Brave)
+            if (Application.platform == RuntimePlatform.OSXEditor)
             {
-                string localEdge = Path.Combine(localAppData, @"Microsoft\Edge\Application\msedge.exe");
-                if (File.Exists(localEdge)) return localEdge;
+                string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                string[] macCandidates = new[]
+                {
+                    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+                    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+                    "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+                    Path.Combine(home, "Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+                    Path.Combine(home, "Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
+                    Path.Combine(home, "Applications/Chromium.app/Contents/MacOS/Chromium"),
+                    Path.Combine(home, "Applications/Brave Browser.app/Contents/MacOS/Brave Browser")
+                };
 
-                string localChrome = Path.Combine(localAppData, @"Google\Chrome\Application\chrome.exe");
-                if (File.Exists(localChrome)) return localChrome;
+                foreach (var path in macCandidates)
+                {
+                    if (File.Exists(path)) return path;
+                }
             }
 
-            // 4. Windows Registry App Paths
-            try
+            // 2. Linux installations
+            if (Application.platform == RuntimePlatform.LinuxEditor)
             {
-                object regEdge = Microsoft.Win32.Registry.GetValue(@"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe", "", null);
-                if (regEdge is string pathEdge && File.Exists(pathEdge)) return pathEdge;
+                string[] linuxCandidates = new[]
+                {
+                    "/usr/bin/google-chrome",
+                    "/usr/bin/google-chrome-stable",
+                    "/usr/bin/chromium",
+                    "/usr/bin/chromium-browser",
+                    "/usr/bin/microsoft-edge",
+                    "/usr/bin/brave-browser",
+                    "/snap/bin/chromium"
+                };
 
-                object regChrome = Microsoft.Win32.Registry.GetValue(@"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe", "", null);
-                if (regChrome is string pathChrome && File.Exists(pathChrome)) return pathChrome;
+                foreach (var path in linuxCandidates)
+                {
+                    if (File.Exists(path)) return path;
+                }
             }
-            catch {}
+
+            // 3. Windows locations
+            if (Application.platform == RuntimePlatform.WindowsEditor)
+            {
+                // Standard Microsoft Edge locations (Pre-installed on every Windows 10/11 system)
+                string edgeX86 = @"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe";
+                if (File.Exists(edgeX86)) return edgeX86;
+
+                string edge64 = @"C:\Program Files\Microsoft\Edge\Application\msedge.exe";
+                if (File.Exists(edge64)) return edge64;
+
+                // Google Chrome locations
+                string chrome64 = @"C:\Program Files\Google\Chrome\Application\chrome.exe";
+                if (File.Exists(chrome64)) return chrome64;
+
+                string chromeX86 = @"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe";
+                if (File.Exists(chromeX86)) return chromeX86;
+
+                // User Local AppData installations
+                string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+                if (!string.IsNullOrEmpty(localAppData))
+                {
+                    string localEdge = Path.Combine(localAppData, @"Microsoft\Edge\Application\msedge.exe");
+                    if (File.Exists(localEdge)) return localEdge;
+
+                    string localChrome = Path.Combine(localAppData, @"Google\Chrome\Application\chrome.exe");
+                    if (File.Exists(localChrome)) return localChrome;
+                }
+
+                // Windows Registry App Paths
+                try
+                {
+                    object regEdge = Microsoft.Win32.Registry.GetValue(@"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe", "", null);
+                    if (regEdge is string pathEdge && File.Exists(pathEdge)) return pathEdge;
+
+                    object regChrome = Microsoft.Win32.Registry.GetValue(@"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe", "", null);
+                    if (regChrome is string pathChrome && File.Exists(pathChrome)) return pathChrome;
+                }
+                catch {}
+            }
 
             return null;
         }
@@ -166,10 +217,12 @@ namespace AceModules.LiveSceneAuditor
 
             StringBuilder sb = new StringBuilder(32768);
 
-            string healthStatusClass = report.isOverBudget ? "badge-fail" : "badge-pass";
+            string healthStatusClass = report.isOverBudget ? "badge-fail" : (report.overallHealthPercentage >= 100f ? "badge-warn" : (report.overallHealthPercentage >= 75f ? "badge-warn" : "badge-pass"));
             string healthStatusText = report.isOverBudget 
                 ? $"FAIL - OVER BUDGET ({report.overallHealthPercentage:F0}%)" 
-                : $"PASS - WITHIN BUDGET ({report.overallHealthPercentage:F0}%)";
+                : (report.overallHealthPercentage >= 100f 
+                    ? $"WARN - FULLY USED BUDGET ({report.overallHealthPercentage:F0}%)" 
+                    : $"PASS - WITHIN BUDGET ({report.overallHealthPercentage:F0}%)");
 
             sb.AppendLine("<!DOCTYPE html>");
             sb.AppendLine("<html lang='en'>");
@@ -232,6 +285,11 @@ namespace AceModules.LiveSceneAuditor
                     background-color: #fef2f2;
                     border: 1px solid #fecaca;
                     color: #991b1b;
+                }
+                .status-warn {
+                    background-color: #fffbeb;
+                    border: 1px solid #fde68a;
+                    color: #92400e;
                 }
                 h2 {
                     font-size: 12.5px;
@@ -341,7 +399,7 @@ namespace AceModules.LiveSceneAuditor
             sb.AppendLine("</div>");
 
             // Overall Health Status Bar
-            string cardClass = report.isOverBudget ? "status-fail" : "status-pass";
+            string cardClass = report.isOverBudget ? "status-fail" : (report.overallHealthPercentage >= 75f ? "status-warn" : "status-pass");
             sb.AppendLine($"<div class='status-card {cardClass}'>");
             sb.AppendLine($"  <div><b>Overall Budget Status:</b> <span class='badge {healthStatusClass}'>{healthStatusText}</span></div>");
             sb.AppendLine($"  <div><b>Health Score:</b> <b>{report.overallHealthPercentage:F0}%</b> (100% = At Budget Limit)</div>");
@@ -387,6 +445,36 @@ namespace AceModules.LiveSceneAuditor
             sb.AppendLine($"  <span><b>Area/Disc:</b> {report.areaLightsCount}</span> &nbsp;|&nbsp; ");
             sb.AppendLine($"  <span><b>Shadow Casters:</b> {report.shadowCasterLightsCount}</span>");
             sb.AppendLine("</div>");
+
+            // Texture Count with respect to Size Breakdown Card
+            if (report.textureSizeBreakdown != null && report.textureSizeBreakdown.Count > 0)
+            {
+                sb.AppendLine("<div class='card' style='margin-bottom: 12px;'>");
+                sb.AppendLine("  <div style='display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;'>");
+                sb.AppendLine($"    <b>Texture Count with respect to Size (Total: {report.totalTexturesCount} Textures):</b>");
+                sb.AppendLine($"    <span class='subtle'>Combined Texture Area Score: <b>{report.textureAreaScore:F1}</b> pts</span>");
+                sb.AppendLine("  </div>");
+                sb.AppendLine("  <table>");
+                sb.AppendLine("    <tr><th style='width:30px;'>#</th><th>Resolution</th><th class='num'>Texture Count</th><th class='num'>% of Total</th><th class='num'>Combined Area Score</th><th>Sample Texture Assets</th></tr>");
+
+                for (int bIdx = 0; bIdx < report.textureSizeBreakdown.Count; bIdx++)
+                {
+                    var bucket = report.textureSizeBreakdown[bIdx];
+                    string badgeCls = (bucket.width >= 4096 || bucket.height >= 4096)
+                        ? "badge-fail"
+                        : ((bucket.width >= 2048 || bucket.height >= 2048)
+                            ? "badge-warn"
+                            : "badge-pass");
+
+                    string sampleTex = bucket.textureNames.Count > 0
+                        ? string.Join(", ", bucket.textureNames.Take(4).Select(n => $"<code>{Escape(n)}</code>")) + (bucket.textureNames.Count > 4 ? $" <span class='subtle'>+{bucket.textureNames.Count - 4} more</span>" : "")
+                        : "<span class='subtle'>-</span>";
+
+                    sb.AppendLine($"    <tr><td class='num'>{bIdx + 1}</td><td><b>{Escape(bucket.resolution)}</b></td><td class='num'><span class='badge {badgeCls}'><b>{bucket.count:N0}</b> {(bucket.count == 1 ? "tex" : "texs")}</span></td><td class='num'>{bucket.percentageOfTotal:F1}%</td><td class='num'><b>{bucket.totalScore:F1}</b> pts</td><td>{sampleTex}</td></tr>");
+                }
+                sb.AppendLine("  </table>");
+                sb.AppendLine("</div>");
+            }
 
             // SECTION 3: TOP CULPRITS (RANKED BY SEVERITY SCORE)
             var allCulprits = report.culprits
@@ -467,6 +555,15 @@ namespace AceModules.LiveSceneAuditor
                 .ToList();
 
             sb.AppendLine($"<h3>4B. Heavy Textures ({texCulprits.Count} Items - Sorted by Severity)</h3>");
+            if (report.textureSizeBreakdown != null && report.textureSizeBreakdown.Count > 0)
+            {
+                string sizeBadges = string.Join(" &nbsp; ", report.textureSizeBreakdown.Select(b =>
+                {
+                    string cls = (b.width >= 4096 || b.height >= 4096) ? "badge-fail" : ((b.width >= 2048 || b.height >= 2048) ? "badge-warn" : "badge-pass");
+                    return $"<span class='badge {cls}'>{Escape(b.resolution)}: <b>{b.count}</b></span>";
+                }));
+                sb.AppendLine($"<p style='margin: 4px 0 8px 0;'><b>Size Breakdown:</b> &nbsp; {sizeBadges}</p>");
+            }
             if (texCulprits.Count == 0)
             {
                 sb.AppendLine("<p>No heavy textures detected.</p>");
@@ -616,7 +713,70 @@ namespace AceModules.LiveSceneAuditor
 
                     if (!string.IsNullOrEmpty(vp.topCulpritName) && vp.topCulpritName != "None")
                     {
-                        sb.AppendLine($"  <div style='font-size:9px;'><b>Top Culprit in Vantage Point:</b> {Escape(vp.topCulpritName)} &bull; <b>{vp.topCulpritTris:N0} Triangles</b></div>");
+                        sb.AppendLine($"  <div style='font-size:9px; margin-bottom:6px;'><b>Top Culprit in Vantage Point:</b> {Escape(vp.topCulpritName)} &bull; <b>{vp.topCulpritTris:N0} Triangles</b></div>");
+                    }
+
+                    // Contributing Meshes / Models Table
+                    if (vp.contributingRenderers != null && vp.contributingRenderers.Count > 0)
+                    {
+                        int showCount = Mathf.Min(8, vp.contributingRenderers.Count);
+                        sb.AppendLine($"  <div style='margin-top:6px; margin-bottom:3px;'><b>Top Contributing Meshes &amp; Models in View ({vp.contributingRenderers.Count} Total):</b></div>");
+                        sb.AppendLine("  <table>");
+                        sb.AppendLine("    <tr><th style='width:25px;'>#</th><th>Object / Model Name</th><th>FBX Asset</th><th class='num'>Triangles</th><th class='num'>Vertices</th><th class='num'>Materials</th></tr>");
+                        for (int rIdx = 0; rIdx < showCount; rIdx++)
+                        {
+                            var cr = vp.contributingRenderers[rIdx];
+                            string fbxDisplay = !string.IsNullOrEmpty(cr.fbxName) ? Escape(cr.fbxName) : "<span class='subtle'>Scene Mesh</span>";
+                            sb.AppendLine($"    <tr><td class='num'>{rIdx + 1}</td><td><b>{Escape(cr.name)}</b></td><td class='subtle'>{fbxDisplay}</td><td class='num'><b>{cr.triangleCount:N0}</b></td><td class='num'>{cr.vertexCount:N0}</td><td class='num'>{cr.materialCount}</td></tr>");
+                        }
+                        sb.AppendLine("  </table>");
+                        if (vp.contributingRenderers.Count > showCount)
+                        {
+                            sb.AppendLine($"  <div class='subtle' style='margin-top:-6px; margin-bottom:6px;'>... and {vp.contributingRenderers.Count - showCount} additional smaller meshes in view.</div>");
+                        }
+                    }
+
+                    // Contributing Materials Badges
+                    if (vp.materialNames != null && vp.materialNames.Count > 0)
+                    {
+                        sb.AppendLine($"  <div style='margin-top:6px; margin-bottom:4px;'><b>Unique Materials in View ({vp.materialNames.Count}):</b></div>");
+                        sb.AppendLine("  <div style='margin-bottom:6px;'>");
+                        foreach (var mName in vp.materialNames)
+                        {
+                            sb.AppendLine($"    <span class='badge badge-mesh' style='margin:1px 2px;'>🎨 {Escape(mName)}</span>");
+                        }
+                        sb.AppendLine("  </div>");
+                    }
+
+                    // Contributing Textures Badges
+                    var viewTextures = (vp.contributingRenderers != null)
+                        ? vp.contributingRenderers.SelectMany(r => r.textureNames ?? new List<string>()).Distinct().ToList()
+                        : new List<string>();
+                    if (viewTextures.Count > 0)
+                    {
+                        sb.AppendLine($"  <div style='margin-top:4px; margin-bottom:4px;'><b>Unique Textures in View ({viewTextures.Count}):</b></div>");
+                        sb.AppendLine("  <div style='margin-bottom:6px;'>");
+                        foreach (var tName in viewTextures)
+                        {
+                            sb.AppendLine($"    <span class='badge badge-tex' style='margin:1px 2px;'>🖼️ {Escape(tName)}</span>");
+                        }
+                        sb.AppendLine("  </div>");
+                    }
+
+                    // Contributing Lights Table
+                    if (vp.contributingLights != null && vp.contributingLights.Count > 0)
+                    {
+                        sb.AppendLine($"  <div style='margin-top:6px; margin-bottom:3px;'><b>Visible Lights in Frustum ({vp.contributingLights.Count}):</b></div>");
+                        sb.AppendLine("  <table>");
+                        sb.AppendLine("    <tr><th style='width:25px;'>#</th><th>Light Name</th><th>Type</th><th>Mode</th><th>Shadows</th><th class='num'>Range</th><th class='num'>Intensity</th></tr>");
+                        for (int lIdx = 0; lIdx < vp.contributingLights.Count; lIdx++)
+                        {
+                            var cl = vp.contributingLights[lIdx];
+                            string mode = cl.isBaked ? "Baked" : (cl.isMixed ? "Mixed" : "Realtime");
+                            string shadow = cl.shadows != LightShadows.None ? cl.shadows.ToString() : "None";
+                            sb.AppendLine($"    <tr><td class='num'>{lIdx + 1}</td><td><b>{Escape(cl.name)}</b></td><td>{cl.type}</td><td>{mode}</td><td>{shadow}</td><td class='num'>{cl.range:F1}m</td><td class='num'>{cl.intensity:F2}</td></tr>");
+                        }
+                        sb.AppendLine("  </table>");
                     }
                     sb.AppendLine("</div>");
                 }
@@ -637,8 +797,8 @@ namespace AceModules.LiveSceneAuditor
         {
             float ratio = budget > 0 ? ((float)current / budget) : 0f;
             float percent = ratio * 100f;
-            string badgeClass = (ratio >= 1.0f) ? "badge-fail" : (ratio >= 0.75f ? "badge-warn" : "badge-pass");
-            string statusText = (ratio >= 1.0f) ? "OVER BUDGET" : (ratio >= 0.75f ? "WARNING" : "OK");
+            string badgeClass = (ratio > 1.0f) ? "badge-fail" : (ratio >= 0.75f ? "badge-warn" : "badge-pass");
+            string statusText = (ratio > 1.0f) ? "OVER BUDGET" : (ratio >= 1.0f ? "FULLY USED" : (ratio >= 0.75f ? "WARNING" : "OK"));
 
             sb.AppendLine($"  <tr><td><b>{Escape(label)}</b></td><td class='num'><b>{current:N0}</b> {unit}</td><td class='num'>{budget:N0} {unit}</td><td class='num'>{percent:F1}%</td><td style='text-align:center;'><span class='badge {badgeClass}'>{statusText}</span></td><td class='subtle'>{Escape(notes)}</td></tr>");
         }
@@ -647,8 +807,8 @@ namespace AceModules.LiveSceneAuditor
         {
             float ratio = budget > 0f ? (current / budget) : 0f;
             float percent = ratio * 100f;
-            string badgeClass = (ratio >= 1.0f) ? "badge-fail" : (ratio >= 0.75f ? "badge-warn" : "badge-pass");
-            string statusText = (ratio >= 1.0f) ? "OVER BUDGET" : (ratio >= 0.75f ? "WARNING" : "OK");
+            string badgeClass = (ratio > 1.0f) ? "badge-fail" : (ratio >= 0.75f ? "badge-warn" : "badge-pass");
+            string statusText = (ratio > 1.0f) ? "OVER BUDGET" : (ratio >= 1.0f ? "FULLY USED" : (ratio >= 0.75f ? "WARNING" : "OK"));
 
             sb.AppendLine($"  <tr><td><b>{Escape(label)}</b></td><td class='num'><b>{current:F1}</b> {unit}</td><td class='num'>{budget:F1} {unit}</td><td class='num'>{percent:F1}%</td><td style='text-align:center;'><span class='badge {badgeClass}'>{statusText}</span></td><td class='subtle'>{Escape(notes)}</td></tr>");
         }
@@ -661,12 +821,369 @@ namespace AceModules.LiveSceneAuditor
 
         // ==========================================
         // STANDALONE PURE C# PDF GENERATOR FALLBACK
-        // Standard PDF 1.4 Vector File Generator
+        // Standard PDF 1.4 Multi-Page Vector Engine
         // ==========================================
+        private class FallbackPdfPage
+        {
+            public readonly StringBuilder cs = new StringBuilder(8192);
+            public float y = 780f;
+        }
+
+        private class FallbackPdfBuilder
+        {
+            public readonly List<FallbackPdfPage> Pages = new List<FallbackPdfPage>();
+            public FallbackPdfPage CurrentPage => Pages[Pages.Count - 1];
+
+            public FallbackPdfBuilder()
+            {
+                Pages.Add(new FallbackPdfPage());
+            }
+
+            public void EnsureSpace(float neededHeight, Action onNewPage = null)
+            {
+                if (CurrentPage.y - neededHeight < 55f)
+                {
+                    var newPage = new FallbackPdfPage();
+                    Pages.Add(newPage);
+
+                    // Continuation top header banner
+                    newPage.cs.Append("0.1 0.25 0.65 rg 40 805 515 20 re f\n");
+                    newPage.cs.Append("1 1 1 rg BT /F2 9.5 Tf 45 811 Td (Live Scene Auditor - Performance Audit Report (Continued)) Tj ET\n");
+                    newPage.y = 785f;
+
+                    onNewPage?.Invoke();
+                }
+            }
+        }
+
         private static bool GenerateFallbackPdf(SceneAuditReport report, BudgetProfile profile, bool includeInactive, string targetPdfPath)
         {
             try
             {
+                var doc = new FallbackPdfBuilder();
+
+                // ------------------------------------------
+                // PAGE 1: HEADER & OVERALL HEALTH CARD
+                // ------------------------------------------
+                var p1 = doc.CurrentPage;
+
+                // Draw Top Header Banner
+                p1.cs.Append("0.1 0.25 0.65 rg 40 790 515 35 re f\n");
+                p1.cs.Append("1 1 1 rg BT /F2 14 Tf 50 802 Td (Live Scene Auditor - Performance Audit Report) Tj ET\n");
+
+                // Subtitle
+                string sceneInfo = $"Project: {SanitizeAscii(Application.productName)} | Scene: {SanitizeAscii(SceneManager.GetActiveScene().name)} | Target: {EditorUserBuildSettings.activeBuildTarget} | Date: {DateTime.Now:yyyy-MM-dd}";
+                p1.cs.Append("0.2 0.2 0.2 rg BT /F1 9 Tf 40 775 Td (" + EscapePdf(sceneInfo) + ") Tj ET\n");
+
+                // Health Status Box
+                if (report.isOverBudget)
+                {
+                    p1.cs.Append("1 0.9 0.9 rg 40 735 515 26 re f 0.8 0.2 0.2 RG 40 735 515 26 re S\n");
+                    p1.cs.Append("0.6 0.1 0.1 rg BT /F2 10 Tf 50 744 Td (FAIL - OVER BUDGET (" + $"{report.overallHealthPercentage:F0}" + "%)) Tj ET\n");
+                }
+                else if (report.overallHealthPercentage >= 100f)
+                {
+                    p1.cs.Append("1 0.96 0.88 rg 40 735 515 26 re f 0.8 0.6 0.2 RG 40 735 515 26 re S\n");
+                    p1.cs.Append("0.7 0.4 0.1 rg BT /F2 10 Tf 50 744 Td (WARN - FULLY USED BUDGET (" + $"{report.overallHealthPercentage:F0}" + "%)) Tj ET\n");
+                }
+                else
+                {
+                    p1.cs.Append("0.9 1 0.9 rg 40 735 515 26 re f 0.2 0.7 0.2 RG 40 735 515 26 re S\n");
+                    p1.cs.Append("0.1 0.5 0.1 rg BT /F2 10 Tf 50 744 Td (PASS - WITHIN BUDGET (" + $"{report.overallHealthPercentage:F0}" + "%)) Tj ET\n");
+                }
+
+                p1.y = 715f;
+
+                // ------------------------------------------
+                // SECTION 1: SCENE PERFORMANCE OVERVIEW
+                // ------------------------------------------
+                void DrawSection1Header()
+                {
+                    var cur = doc.CurrentPage;
+                    cur.cs.Append("0.15 0.35 0.7 rg BT /F2 11 Tf 40 " + cur.y + " Td (1. Scene Performance Overview & Budgets) Tj ET\n");
+                    cur.y -= 20;
+                    cur.cs.Append("0.15 0.35 0.7 rg 40 " + cur.y + " 515 18 re f\n");
+                    cur.cs.Append("1 1 1 rg BT /F2 8.5 Tf 45 " + (cur.y + 5) + " Td (METRIC) Tj 220 " + (cur.y + 5) + " Td (SCENE VALUE) Tj 320 " + (cur.y + 5) + " Td (BUDGET) Tj 410 " + (cur.y + 5) + " Td (USAGE) Tj 480 " + (cur.y + 5) + " Td (STATUS) Tj ET\n");
+                }
+
+                DrawSection1Header();
+
+                (string label, string val, string bgt, float ratio)[] s1Rows = new[]
+                {
+                    ("Total Scene Triangles", $"{report.totalSceneTriangles:N0}", $"{profile.maxTriangles:N0}", (float)report.totalSceneTriangles / Mathf.Max(1, profile.maxTriangles)),
+                    ("Total Scene Vertices", $"{report.totalSceneVertices:N0}", $"{profile.maxVertices:N0}", (float)report.totalSceneVertices / Mathf.Max(1, profile.maxVertices)),
+                    ("Unique Scene Materials", $"{report.uniqueMaterialsCount}", $"{profile.maxMaterialsInScene}", (float)report.uniqueMaterialsCount / Mathf.Max(1, profile.maxMaterialsInScene)),
+                    ("Scene FBX Models", $"{report.fbxModelCount}", $"{profile.maxFbxInScene}", (float)report.fbxModelCount / Mathf.Max(1, profile.maxFbxInScene)),
+                    ("Texture Area Score", $"{report.textureAreaScore:F1} ({report.totalTexturesCount} tex)", $"{profile.maxTextureScore:F1}", report.textureAreaScore / Mathf.Max(0.1f, profile.maxTextureScore)),
+                    ("Total Scene Lights", $"{report.totalLightsCount}", $"{profile.maxTotalLights}", (float)report.totalLightsCount / Mathf.Max(1, profile.maxTotalLights)),
+                    ("Realtime Shadow Casters", $"{report.shadowCasterLightsCount}", $"{profile.maxRealtimeShadowCasters}", (float)report.shadowCasterLightsCount / Mathf.Max(1, profile.maxRealtimeShadowCasters)),
+                };
+
+                for (int r = 0; r < s1Rows.Length; r++)
+                {
+                    var cur = doc.CurrentPage;
+                    cur.y -= 16;
+                    var item = s1Rows[r];
+                    if (r % 2 == 1) cur.cs.Append("0.96 0.97 0.98 rg 40 " + cur.y + " 515 16 re f\n");
+                    cur.cs.Append("0.85 0.85 0.85 RG 40 " + cur.y + " 515 16 re S\n");
+
+                    string status = item.ratio > 1.0f ? "OVER" : (item.ratio >= 1.0f ? "FULL" : (item.ratio >= 0.75f ? "WARN" : "OK"));
+                    cur.cs.Append("0.1 0.1 0.1 rg BT /F1 8 Tf 45 " + (cur.y + 4) + " Td (" + EscapePdf(item.label) + ") Tj 220 " + (cur.y + 4) + " Td (" + EscapePdf(item.val) + ") Tj 320 " + (cur.y + 4) + " Td (" + EscapePdf(item.bgt) + ") Tj 410 " + (cur.y + 4) + " Td (" + $"{item.ratio * 100f:F1}%" + ") Tj ");
+                    if (item.ratio > 1.0f) cur.cs.Append("/F2 8 Tf 0.8 0.1 0.1 rg ");
+                    else if (item.ratio >= 0.75f) cur.cs.Append("/F2 8 Tf 0.8 0.5 0.1 rg ");
+                    else cur.cs.Append("/F1 8 Tf 0.1 0.5 0.1 rg ");
+                    cur.cs.Append("480 " + (cur.y + 4) + " Td (" + status + ") Tj ET\n");
+                }
+
+                // ------------------------------------------
+                // SECTION 2: TEXTURE BREAKDOWN BY SIZE TABLE
+                // ------------------------------------------
+                var texBuckets = report.textureSizeBreakdown ?? new List<TextureSizeBucket>();
+                doc.EnsureSpace(45f);
+
+                void DrawTexSizeTableHeader()
+                {
+                    var cur = doc.CurrentPage;
+                    cur.cs.Append("0.15 0.35 0.7 rg BT /F2 11 Tf 40 " + cur.y + " Td (2. Texture Count with respect to Size (" + report.totalTexturesCount + " Total Textures)) Tj ET\n");
+                    cur.y -= 18;
+                    cur.cs.Append("0.15 0.35 0.7 rg 40 " + cur.y + " 515 18 re f\n");
+                    cur.cs.Append("1 1 1 rg BT /F2 8.5 Tf 45 " + (cur.y + 5) + " Td (#) Tj 75 " + (cur.y + 5) + " Td (RESOLUTION) Tj 220 " + (cur.y + 5) + " Td (TEXTURE COUNT) Tj 330 " + (cur.y + 5) + " Td (% OF TOTAL) Tj 430 " + (cur.y + 5) + " Td (COMBINED AREA SCORE) Tj ET\n");
+                }
+
+                doc.CurrentPage.y -= 20;
+                DrawTexSizeTableHeader();
+
+                if (texBuckets.Count == 0)
+                {
+                    doc.CurrentPage.y -= 16;
+                    doc.CurrentPage.cs.Append("0.4 0.4 0.4 rg BT /F1 8 Tf 45 " + (doc.CurrentPage.y + 4) + " Td (No textures detected in active scene.) Tj ET\n");
+                }
+                else
+                {
+                    for (int b = 0; b < texBuckets.Count; b++)
+                    {
+                        doc.EnsureSpace(16f, () => {
+                            var cur = doc.CurrentPage;
+                            cur.cs.Append("0.15 0.35 0.7 rg 40 " + cur.y + " 515 18 re f\n");
+                            cur.cs.Append("1 1 1 rg BT /F2 8.5 Tf 45 " + (cur.y + 5) + " Td (#) Tj 75 " + (cur.y + 5) + " Td (RESOLUTION) Tj 220 " + (cur.y + 5) + " Td (TEXTURE COUNT) Tj 330 " + (cur.y + 5) + " Td (% OF TOTAL) Tj 430 " + (cur.y + 5) + " Td (COMBINED AREA SCORE) Tj ET\n");
+                        });
+
+                        var cur = doc.CurrentPage;
+                        cur.y -= 16;
+                        var bucket = texBuckets[b];
+                        if (b % 2 == 1) cur.cs.Append("0.96 0.97 0.98 rg 40 " + cur.y + " 515 16 re f\n");
+                        cur.cs.Append("0.85 0.85 0.85 RG 40 " + cur.y + " 515 16 re S\n");
+
+                        string cntStr = $"{bucket.count} {(bucket.count == 1 ? "tex" : "texs")}";
+                        cur.cs.Append("0.1 0.1 0.1 rg BT /F1 8 Tf 45 " + (cur.y + 4) + " Td (" + (b + 1) + ") Tj 75 " + (cur.y + 4) + " Td (" + EscapePdf(bucket.resolution) + ") Tj /F2 8 Tf 220 " + (cur.y + 4) + " Td (" + cntStr + ") Tj /F1 8 Tf 330 " + (cur.y + 4) + " Td (" + $"{bucket.percentageOfTotal:F1}%" + ") Tj 430 " + (cur.y + 4) + " Td (" + $"{bucket.totalScore:F1} pts" + ") Tj ET\n");
+                    }
+                }
+
+                // ------------------------------------------
+                // SECTION 3: TOP PERFORMANCE CULPRITS
+                // ------------------------------------------
+                var topCulprits = report.culprits.OrderByDescending(c => c.severityScore).ToList();
+                doc.EnsureSpace(50f);
+
+                void DrawCulpritTableHeader()
+                {
+                    var cur = doc.CurrentPage;
+                    cur.cs.Append("0.15 0.35 0.7 rg BT /F2 11 Tf 40 " + cur.y + " Td (3. Top Performance Culprits (Ranked by Severity Score)) Tj ET\n");
+                    cur.y -= 18;
+                    cur.cs.Append("0.15 0.35 0.7 rg 40 " + cur.y + " 515 18 re f\n");
+                    cur.cs.Append("1 1 1 rg BT /F2 8.5 Tf 45 " + (cur.y + 5) + " Td (#) Tj 65 " + (cur.y + 5) + " Td (TYPE) Tj 115 " + (cur.y + 5) + " Td (NAME / ASSET) Tj 340 " + (cur.y + 5) + " Td (METRIC) Tj 480 " + (cur.y + 5) + " Td (SEVERITY) Tj ET\n");
+                }
+
+                doc.CurrentPage.y -= 22;
+                DrawCulpritTableHeader();
+
+                int culpritCountToRender = Mathf.Min(topCulprits.Count, 25);
+                for (int c = 0; c < culpritCountToRender; c++)
+                {
+                    doc.EnsureSpace(16f, () => {
+                        var cur = doc.CurrentPage;
+                        cur.cs.Append("0.15 0.35 0.7 rg 40 " + cur.y + " 515 18 re f\n");
+                        cur.cs.Append("1 1 1 rg BT /F2 8.5 Tf 45 " + (cur.y + 5) + " Td (#) Tj 65 " + (cur.y + 5) + " Td (TYPE) Tj 115 " + (cur.y + 5) + " Td (NAME / ASSET) Tj 340 " + (cur.y + 5) + " Td (METRIC) Tj 480 " + (cur.y + 5) + " Td (SEVERITY) Tj ET\n");
+                    });
+
+                    var cur = doc.CurrentPage;
+                    cur.y -= 16;
+                    var item = topCulprits[c];
+                    if (c % 2 == 1) cur.cs.Append("0.96 0.97 0.98 rg 40 " + cur.y + " 515 16 re f\n");
+                    cur.cs.Append("0.85 0.85 0.85 RG 40 " + cur.y + " 515 16 re S\n");
+
+                    string tName = item.type switch { CulpritType.MeshGeometry => "Mesh", CulpritType.TextureSize => "Texture", CulpritType.Light => "Light", _ => "Other" };
+                    string cName = SanitizeAscii(item.name);
+                    if (cName.Length > 36) cName = cName.Substring(0, 33) + "...";
+
+                    string cMetric = SanitizeAscii(item.primaryMetricText);
+                    if (cMetric.Length > 24) cMetric = cMetric.Substring(0, 21) + "...";
+
+                    cur.cs.Append("0.1 0.1 0.1 rg BT /F1 8 Tf 45 " + (cur.y + 4) + " Td (" + (c + 1) + ") Tj 65 " + (cur.y + 4) + " Td (" + tName + ") Tj 115 " + (cur.y + 4) + " Td (" + EscapePdf(cName) + ") Tj 340 " + (cur.y + 4) + " Td (" + EscapePdf(cMetric) + ") Tj /F2 8 Tf 480 " + (cur.y + 4) + " Td (" + $"{item.severityScore:F1}" + ") Tj ET\n");
+                }
+
+                // ------------------------------------------
+                // SECTION 4: ATLASING OPTIMIZATION SUGGESTIONS
+                // ------------------------------------------
+                if (report.atlasSuggestions != null && report.atlasSuggestions.Count > 0)
+                {
+                    doc.EnsureSpace(50f);
+                    void DrawAtlasTableHeader()
+                    {
+                        var cur = doc.CurrentPage;
+                        cur.cs.Append("0.15 0.35 0.7 rg BT /F2 11 Tf 40 " + cur.y + " Td (4. Atlasing Optimization Suggestions (" + report.atlasSuggestions.Count + " Shader Groups)) Tj ET\n");
+                        cur.y -= 18;
+                        cur.cs.Append("0.15 0.35 0.7 rg 40 " + cur.y + " 515 18 re f\n");
+                        cur.cs.Append("1 1 1 rg BT /F2 8.5 Tf 45 " + (cur.y + 5) + " Td (#) Tj 65 " + (cur.y + 5) + " Td (SHADER NAME) Tj 270 " + (cur.y + 5) + " Td (CANDIDATE MATERIALS) Tj 380 " + (cur.y + 5) + " Td (DRAW CALL SAVINGS) Tj 470 " + (cur.y + 5) + " Td (SUGGESTED ATLAS) Tj ET\n");
+                    }
+
+                    doc.CurrentPage.y -= 22;
+                    DrawAtlasTableHeader();
+
+                    for (int a = 0; a < report.atlasSuggestions.Count; a++)
+                    {
+                        doc.EnsureSpace(16f, () => {
+                            var cur = doc.CurrentPage;
+                            cur.cs.Append("0.15 0.35 0.7 rg 40 " + cur.y + " 515 18 re f\n");
+                            cur.cs.Append("1 1 1 rg BT /F2 8.5 Tf 45 " + (cur.y + 5) + " Td (#) Tj 65 " + (cur.y + 5) + " Td (SHADER NAME) Tj 270 " + (cur.y + 5) + " Td (CANDIDATE MATERIALS) Tj 380 " + (cur.y + 5) + " Td (DRAW CALL SAVINGS) Tj 470 " + (cur.y + 5) + " Td (SUGGESTED ATLAS) Tj ET\n");
+                        });
+
+                        var cur = doc.CurrentPage;
+                        cur.y -= 16;
+                        var grp = report.atlasSuggestions[a];
+                        if (a % 2 == 1) cur.cs.Append("0.96 0.97 0.98 rg 40 " + cur.y + " 515 16 re f\n");
+                        cur.cs.Append("0.85 0.85 0.85 RG 40 " + cur.y + " 515 16 re S\n");
+
+                        string sName = SanitizeAscii(grp.shaderName);
+                        if (sName.Length > 36) sName = sName.Substring(0, 33) + "...";
+
+                        int candCount = grp.candidates != null ? grp.candidates.Count : 0;
+                        cur.cs.Append("0.1 0.1 0.1 rg BT /F1 8 Tf 45 " + (cur.y + 4) + " Td (" + (a + 1) + ") Tj 65 " + (cur.y + 4) + " Td (" + EscapePdf(sName) + ") Tj 270 " + (cur.y + 4) + " Td (" + candCount + " mats) Tj /F2 8 Tf 0.1 0.5 0.1 rg 380 " + (cur.y + 4) + " Td (Save " + grp.potentialMaterialSavings + " calls) Tj /F1 8 Tf 0.1 0.1 0.1 rg 470 " + (cur.y + 4) + " Td (" + EscapePdf(grp.suggestedAtlasSize) + ") Tj ET\n");
+                    }
+                }
+
+                // ------------------------------------------
+                // SECTION 5: VIEWS SPECIFIC PERFORMANCE REPORT
+                // ------------------------------------------
+                var viewpointStats = report.viewpointStats ?? new List<ViewpointAuditStat>();
+                if (viewpointStats.Count > 0)
+                {
+                    doc.EnsureSpace(50f);
+                    void DrawViewsMasterHeader()
+                    {
+                        var cur = doc.CurrentPage;
+                        cur.cs.Append("0.15 0.35 0.7 rg BT /F2 11 Tf 40 " + cur.y + " Td (5. Views Specific Performance Report (" + viewpointStats.Count + " Viewpoints Audited)) Tj ET\n");
+                        cur.y -= 18;
+                        cur.cs.Append("0.15 0.35 0.7 rg 40 " + cur.y + " 515 18 re f\n");
+                        cur.cs.Append("1 1 1 rg BT /F2 8.5 Tf 45 " + (cur.y + 5) + " Td (#) Tj 65 " + (cur.y + 5) + " Td (VIEWPOINT NAME) Tj 215 " + (cur.y + 5) + " Td (TRIS) Tj 290 " + (cur.y + 5) + " Td (VERTS) Tj 365 " + (cur.y + 5) + " Td (MATS) Tj 420 " + (cur.y + 5) + " Td (LIGHTS) Tj 480 " + (cur.y + 5) + " Td (STATUS) Tj ET\n");
+                    }
+
+                    doc.CurrentPage.y -= 22;
+                    DrawViewsMasterHeader();
+
+                    for (int v = 0; v < viewpointStats.Count; v++)
+                    {
+                        doc.EnsureSpace(16f, () => {
+                            var cur = doc.CurrentPage;
+                            cur.cs.Append("0.15 0.35 0.7 rg 40 " + cur.y + " 515 18 re f\n");
+                            cur.cs.Append("1 1 1 rg BT /F2 8.5 Tf 45 " + (cur.y + 5) + " Td (#) Tj 65 " + (cur.y + 5) + " Td (VIEWPOINT NAME) Tj 215 " + (cur.y + 5) + " Td (TRIS) Tj 290 " + (cur.y + 5) + " Td (VERTS) Tj 365 " + (cur.y + 5) + " Td (MATS) Tj 420 " + (cur.y + 5) + " Td (LIGHTS) Tj 480 " + (cur.y + 5) + " Td (STATUS) Tj ET\n");
+                        });
+
+                        var cur = doc.CurrentPage;
+                        cur.y -= 16;
+                        var vp = viewpointStats[v];
+                        if (v % 2 == 1) cur.cs.Append("0.96 0.97 0.98 rg 40 " + cur.y + " 515 16 re f\n");
+                        cur.cs.Append("0.85 0.85 0.85 RG 40 " + cur.y + " 515 16 re S\n");
+
+                        string vName = SanitizeAscii(vp.viewpointName);
+                        if (vName.Length > 24) vName = vName.Substring(0, 21) + "...";
+                        string statStr = vp.isOverBudget ? "OVER" : (vp.healthPercentage >= 100f ? "FULL" : (vp.healthPercentage >= 75f ? "WARN" : "PASS"));
+
+                        cur.cs.Append("0.1 0.1 0.1 rg BT /F1 8 Tf 45 " + (cur.y + 4) + " Td (" + (v + 1) + ") Tj 65 " + (cur.y + 4) + " Td (" + EscapePdf(vName) + ") Tj 215 " + (cur.y + 4) + " Td (" + $"{vp.visibleTriangles:N0}" + ") Tj 290 " + (cur.y + 4) + " Td (" + $"{vp.visibleVertices:N0}" + ") Tj 365 " + (cur.y + 4) + " Td (" + vp.uniqueMaterialsCount + ") Tj 420 " + (cur.y + 4) + " Td (" + vp.visibleLightsCount + ") Tj ");
+                        if (vp.isOverBudget) cur.cs.Append("/F2 8 Tf 0.8 0.1 0.1 rg ");
+                        else if (vp.healthPercentage >= 75f) cur.cs.Append("/F2 8 Tf 0.8 0.5 0.1 rg ");
+                        else cur.cs.Append("/F1 8 Tf 0.1 0.5 0.1 rg ");
+                        cur.cs.Append("480 " + (cur.y + 4) + " Td (" + statStr + ") Tj ET\n");
+                    }
+
+                    // ------------------------------------------
+                    // SECTION 6: VIEWPOINT FRUSTUM DETAILS & ITEMS
+                    // ------------------------------------------
+                    for (int v = 0; v < viewpointStats.Count; v++)
+                    {
+                        var vp = viewpointStats[v];
+                        doc.EnsureSpace(65f);
+
+                        var cur = doc.CurrentPage;
+                        cur.y -= 22;
+                        cur.cs.Append("0.1 0.25 0.6 rg 40 " + cur.y + " 515 16 re f\n");
+                        string vpBannerText = $"Viewpoint #{v + 1}: {SanitizeAscii(vp.viewpointName)}  |  Pos: ({vp.position.x:F1}, {vp.position.y:F1}, {vp.position.z:F1})  |  Status: {vp.statusSummary}";
+                        if (vpBannerText.Length > 90) vpBannerText = vpBannerText.Substring(0, 87) + "...";
+                        cur.cs.Append("1 1 1 rg BT /F2 8.5 Tf 45 " + (cur.y + 4) + " Td (" + EscapePdf(vpBannerText) + ") Tj ET\n");
+
+                        // Frustum stats row
+                        cur.y -= 16;
+                        cur.cs.Append("0.93 0.95 0.98 rg 40 " + cur.y + " 515 16 re f 0.8 0.85 0.9 RG 40 " + cur.y + " 515 16 re S\n");
+                        string vpDetailStr = $"Frustum Tris: {vp.visibleTriangles:N0}  |  Verts: {vp.visibleVertices:N0}  |  Mats: {vp.uniqueMaterialsCount}  |  Lights: {vp.visibleLightsCount}";
+                        cur.cs.Append("0.1 0.1 0.1 rg BT /F1 8 Tf 45 " + (cur.y + 4) + " Td (" + EscapePdf(vpDetailStr) + ") Tj ET\n");
+
+                        // Top Contributing Meshes
+                        if (vp.contributingRenderers != null && vp.contributingRenderers.Count > 0)
+                        {
+                            int meshTake = Mathf.Min(6, vp.contributingRenderers.Count);
+                            cur.y -= 14;
+                            cur.cs.Append("0.2 0.3 0.5 rg BT /F2 8 Tf 45 " + (cur.y + 3) + " Td (Top Contributing Meshes in View:) Tj ET\n");
+
+                            for (int mIdx = 0; mIdx < meshTake; mIdx++)
+                            {
+                                doc.EnsureSpace(14f);
+                                cur = doc.CurrentPage;
+                                cur.y -= 14;
+                                var cr = vp.contributingRenderers[mIdx];
+                                string rName = SanitizeAscii(cr.name);
+                                if (rName.Length > 30) rName = rName.Substring(0, 27) + "...";
+                                string fbxStr = !string.IsNullOrEmpty(cr.fbxName) ? SanitizeAscii(cr.fbxName) : "Scene Mesh";
+                                if (fbxStr.Length > 24) fbxStr = fbxStr.Substring(0, 21) + "...";
+
+                                cur.cs.Append("0.2 0.2 0.2 rg BT /F1 7.5 Tf 50 " + (cur.y + 3) + " Td (" + (mIdx + 1) + ". " + EscapePdf(rName) + ") Tj 240 " + (cur.y + 3) + " Td (" + EscapePdf(fbxStr) + ") Tj /F2 7.5 Tf 380 " + (cur.y + 3) + " Td (" + $"{cr.triangleCount:N0} tris" + ") Tj /F1 7.5 Tf 460 " + (cur.y + 3) + " Td (" + $"{cr.vertexCount:N0} verts" + ") Tj ET\n");
+                            }
+                        }
+
+                        // Contributing Lights
+                        if (vp.contributingLights != null && vp.contributingLights.Count > 0)
+                        {
+                            int lightTake = Mathf.Min(4, vp.contributingLights.Count);
+                            cur.y -= 14;
+                            cur.cs.Append("0.2 0.3 0.5 rg BT /F2 8 Tf 45 " + (cur.y + 3) + " Td (Visible Lights in View Frustum:) Tj ET\n");
+
+                            for (int lIdx = 0; lIdx < lightTake; lIdx++)
+                            {
+                                doc.EnsureSpace(14f);
+                                cur = doc.CurrentPage;
+                                cur.y -= 14;
+                                var cl = vp.contributingLights[lIdx];
+                                string lName = SanitizeAscii(cl.name);
+                                if (lName.Length > 28) lName = lName.Substring(0, 25) + "...";
+                                string modeStr = cl.isBaked ? "Baked" : (cl.isMixed ? "Mixed" : "Realtime");
+
+                                cur.cs.Append("0.2 0.2 0.2 rg BT /F1 7.5 Tf 50 " + (cur.y + 3) + " Td (" + (lIdx + 1) + ". " + EscapePdf(lName) + ") Tj 220 " + (cur.y + 3) + " Td (" + cl.type + ") Tj 310 " + (cur.y + 3) + " Td (" + modeStr + ") Tj 390 " + (cur.y + 3) + " Td (" + $"{cl.range:F1}m" + ") Tj 460 " + (cur.y + 3) + " Td (Int: " + $"{cl.intensity:F1}" + ") Tj ET\n");
+                            }
+                        }
+                    }
+                }
+
+                // ------------------------------------------
+                // WRITE PDF 1.4 FILE WITH DYNAMIC PAGES
+                // ------------------------------------------
+                int totalPages = doc.Pages.Count;
+
+                // Append Footers with total page count
+                for (int pIdx = 0; pIdx < totalPages; pIdx++)
+                {
+                    var p = doc.Pages[pIdx];
+                    p.cs.Append("0.5 0.5 0.5 rg BT /F1 7.5 Tf 40 30 Td (Generated by Live Scene Auditor v1.0 | Page " + (pIdx + 1) + " of " + totalPages + " | " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + ") Tj ET\n");
+                }
+
                 using FileStream fs = new FileStream(targetPdfPath, FileMode.Create, FileAccess.Write);
                 using StreamWriter writer = new StreamWriter(fs, Encoding.ASCII);
 
@@ -687,141 +1204,31 @@ namespace AceModules.LiveSceneAuditor
                 WriteObject("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
 
                 // Object 2: Pages container
-                WriteObject("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
-
-                // Object 3: Page definition
-                WriteObject("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595.28 841.89] /Resources << /Font << /F1 4 0 R /F2 5 0 R >> >> /Contents 6 0 R >>\nendobj\n");
-
-                // Object 4: Regular Font (Helvetica)
-                WriteObject("4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n");
-
-                // Object 5: Bold Font (Helvetica-Bold)
-                WriteObject("5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>\nendobj\n");
-
-                // Object 6: Stream Contents with real drawn tables and rows
-                StringBuilder cs = new StringBuilder(8192);
-
-                // Draw Top Header Banner
-                cs.Append("0.1 0.25 0.65 rg 40 790 515 35 re f\n"); // Header rect
-                cs.Append("1 1 1 rg BT /F2 14 Tf 50 802 Td (Live Scene Auditor - Performance Audit Report) Tj ET\n");
-
-                // Subtitle
-                string sceneInfo = $"Project: {SanitizeAscii(Application.productName)} | Scene: {SanitizeAscii(SceneManager.GetActiveScene().name)} | Date: {DateTime.Now:yyyy-MM-dd}";
-                cs.Append("0.2 0.2 0.2 rg BT /F1 9 Tf 40 775 Td (" + EscapePdf(sceneInfo) + ") Tj ET\n");
-
-                // Health Status Box
-                if (report.isOverBudget)
+                StringBuilder kidsSb = new StringBuilder();
+                for (int i = 0; i < totalPages; i++)
                 {
-                    cs.Append("1 0.9 0.9 rg 40 735 515 26 re f 0.8 0.2 0.2 RG 40 735 515 26 re S\n");
-                    cs.Append("0.6 0.1 0.1 rg BT /F2 10 Tf 50 744 Td (FAIL - OVER BUDGET (" + $"{report.overallHealthPercentage:F0}" + "%)) Tj ET\n");
+                    int pageObjId = 5 + (i * 2);
+                    kidsSb.Append($"{pageObjId} 0 R ");
                 }
-                else
+                WriteObject($"2 0 obj\n<< /Type /Pages /Kids [{kidsSb.ToString().Trim()}] /Count {totalPages} >>\nendobj\n");
+
+                // Object 3: Font Helvetica (F1)
+                WriteObject("3 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n");
+
+                // Object 4: Font Helvetica-Bold (F2)
+                WriteObject("4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>\nendobj\n");
+
+                // Dynamic Page and Stream objects
+                for (int i = 0; i < totalPages; i++)
                 {
-                    cs.Append("0.9 1 0.9 rg 40 735 515 26 re f 0.2 0.7 0.2 RG 40 735 515 26 re S\n");
-                    cs.Append("0.1 0.5 0.1 rg BT /F2 10 Tf 50 744 Td (PASS - WITHIN BUDGET (" + $"{report.overallHealthPercentage:F0}" + "%)) Tj ET\n");
+                    int pageObjId = 5 + (i * 2);
+                    int streamObjId = 6 + (i * 2);
+
+                    WriteObject($"{pageObjId} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595.28 841.89] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> /Contents {streamObjId} 0 R >>\nendobj\n");
+
+                    byte[] streamBytes = Encoding.ASCII.GetBytes(doc.Pages[i].cs.ToString());
+                    WriteObject($"{streamObjId} 0 obj\n<< /Length {streamBytes.Length} >>\nstream\n{doc.Pages[i].cs}endstream\nendobj\n");
                 }
-
-                // Section 1 Header
-                cs.Append("0.15 0.35 0.7 rg BT /F2 11 Tf 40 715 Td (1. Scene Performance Overview & Budgets) Tj ET\n");
-
-                // Table 1 Header
-                float tableY = 690;
-                cs.Append("0.15 0.35 0.7 rg 40 " + tableY + " 515 18 re f\n");
-                cs.Append("1 1 1 rg BT /F2 8.5 Tf 45 " + (tableY + 5) + " Td (METRIC) Tj 220 " + (tableY + 5) + " Td (SCENE VALUE) Tj 320 " + (tableY + 5) + " Td (BUDGET) Tj 410 " + (tableY + 5) + " Td (USAGE) Tj 480 " + (tableY + 5) + " Td (STATUS) Tj ET\n");
-
-                (string label, string val, string bgt, float ratio)[] rows = new[]
-                {
-                    ("Total Scene Triangles", $"{report.totalSceneTriangles:N0}", $"{profile.maxTriangles:N0}", (float)report.totalSceneTriangles / Mathf.Max(1, profile.maxTriangles)),
-                    ("Total Scene Vertices", $"{report.totalSceneVertices:N0}", $"{profile.maxVertices:N0}", (float)report.totalSceneVertices / Mathf.Max(1, profile.maxVertices)),
-                    ("Unique Scene Materials", $"{report.uniqueMaterialsCount}", $"{profile.maxMaterialsInScene}", (float)report.uniqueMaterialsCount / Mathf.Max(1, profile.maxMaterialsInScene)),
-                    ("Scene FBX Models", $"{report.fbxModelCount}", $"{profile.maxFbxInScene}", (float)report.fbxModelCount / Mathf.Max(1, profile.maxFbxInScene)),
-                    ("Texture Area Score", $"{report.textureAreaScore:F1}", $"{profile.maxTextureScore:F1}", report.textureAreaScore / Mathf.Max(0.1f, profile.maxTextureScore)),
-                    ("Total Scene Lights", $"{report.totalLightsCount}", $"{profile.maxTotalLights}", (float)report.totalLightsCount / Mathf.Max(1, profile.maxTotalLights)),
-                    ("Realtime Shadow Casters", $"{report.shadowCasterLightsCount}", $"{profile.maxRealtimeShadowCasters}", (float)report.shadowCasterLightsCount / Mathf.Max(1, profile.maxRealtimeShadowCasters)),
-                };
-
-                for (int r = 0; r < rows.Length; r++)
-                {
-                    tableY -= 16;
-                    var item = rows[r];
-                    if (r % 2 == 1)
-                    {
-                        cs.Append("0.96 0.97 0.98 rg 40 " + tableY + " 515 16 re f\n");
-                    }
-                    cs.Append("0.85 0.85 0.85 RG 40 " + tableY + " 515 16 re S\n");
-
-                    string status = item.ratio >= 1.0f ? "OVER" : (item.ratio >= 0.75f ? "WARN" : "OK");
-                    cs.Append("0.1 0.1 0.1 rg BT /F1 8 Tf 45 " + (tableY + 4) + " Td (" + EscapePdf(item.label) + ") Tj 220 " + (tableY + 4) + " Td (" + EscapePdf(item.val) + ") Tj 320 " + (tableY + 4) + " Td (" + EscapePdf(item.bgt) + ") Tj 410 " + (tableY + 4) + " Td (" + $"{item.ratio * 100f:F1}%" + ") Tj ");
-                    
-                    if (item.ratio >= 1.0f) cs.Append("/F2 8 Tf 0.8 0.1 0.1 rg ");
-                    else cs.Append("/F1 8 Tf 0.1 0.5 0.1 rg ");
-
-                    cs.Append("480 " + (tableY + 4) + " Td (" + status + ") Tj ET\n");
-                }
-
-                // Section 2: Top Culprits
-                tableY -= 30;
-                cs.Append("0.15 0.35 0.7 rg BT /F2 11 Tf 40 " + tableY + " Td (2. Top Performance Culprits (Ranked by Severity)) Tj ET\n");
-
-                tableY -= 20;
-                cs.Append("0.15 0.35 0.7 rg 40 " + tableY + " 515 18 re f\n");
-                cs.Append("1 1 1 rg BT /F2 8.5 Tf 45 " + (tableY + 5) + " Td (#) Tj 65 " + (tableY + 5) + " Td (TYPE) Tj 115 " + (tableY + 5) + " Td (NAME / ASSET) Tj 340 " + (tableY + 5) + " Td (METRIC) Tj 480 " + (tableY + 5) + " Td (SEVERITY) Tj ET\n");
-
-                int culpritCountToTake = (report.viewpointStats != null && report.viewpointStats.Count > 0) ? 6 : 14;
-                var topCulprits = report.culprits.OrderByDescending(c => c.severityScore).Take(culpritCountToTake).ToList();
-                for (int c = 0; c < topCulprits.Count; c++)
-                {
-                    tableY -= 16;
-                    var item = topCulprits[c];
-                    if (c % 2 == 1)
-                    {
-                        cs.Append("0.96 0.97 0.98 rg 40 " + tableY + " 515 16 re f\n");
-                    }
-                    cs.Append("0.85 0.85 0.85 RG 40 " + tableY + " 515 16 re S\n");
-
-                    string tName = item.type switch { CulpritType.MeshGeometry => "Mesh", CulpritType.TextureSize => "Texture", CulpritType.Light => "Light", _ => "Other" };
-                    string cName = SanitizeAscii(item.name);
-                    if (cName.Length > 36) cName = cName.Substring(0, 33) + "...";
-
-                    string cMetric = SanitizeAscii(item.primaryMetricText);
-                    if (cMetric.Length > 24) cMetric = cMetric.Substring(0, 21) + "...";
-
-                    cs.Append("0.1 0.1 0.1 rg BT /F1 8 Tf 45 " + (tableY + 4) + " Td (" + (c + 1) + ") Tj 65 " + (tableY + 4) + " Td (" + tName + ") Tj 115 " + (tableY + 4) + " Td (" + EscapePdf(cName) + ") Tj 340 " + (tableY + 4) + " Td (" + EscapePdf(cMetric) + ") Tj /F2 8 Tf 480 " + (tableY + 4) + " Td (" + $"{item.severityScore:F1}" + ") Tj ET\n");
-                }
-
-                // Section 3: Views Specific Report (if viewpoints are configured)
-                if (report.viewpointStats != null && report.viewpointStats.Count > 0 && tableY > 100)
-                {
-                    tableY -= 26;
-                    cs.Append("0.15 0.35 0.7 rg BT /F2 11 Tf 40 " + tableY + " Td (3. Views Specific Report (Vantage Points)) Tj ET\n");
-
-                    tableY -= 18;
-                    cs.Append("0.15 0.35 0.7 rg 40 " + tableY + " 515 18 re f\n");
-                    cs.Append("1 1 1 rg BT /F2 8.5 Tf 45 " + (tableY + 5) + " Td (#) Tj 65 " + (tableY + 5) + " Td (VIEWPOINT NAME) Tj 220 " + (tableY + 5) + " Td (TRIS) Tj 310 " + (tableY + 5) + " Td (VERTS) Tj 390 " + (tableY + 5) + " Td (MATS) Tj 440 " + (tableY + 5) + " Td (LIGHTS) Tj 490 " + (tableY + 5) + " Td (STATUS) Tj ET\n");
-
-                    for (int v = 0; v < report.viewpointStats.Count && tableY > 60; v++)
-                    {
-                        tableY -= 16;
-                        var vp = report.viewpointStats[v];
-                        if (v % 2 == 1) cs.Append("0.96 0.97 0.98 rg 40 " + tableY + " 515 16 re f\n");
-                        cs.Append("0.85 0.85 0.85 RG 40 " + tableY + " 515 16 re S\n");
-
-                        string vName = SanitizeAscii(vp.viewpointName);
-                        if (vName.Length > 24) vName = vName.Substring(0, 21) + "...";
-                        string statStr = vp.isOverBudget ? "OVER" : "PASS";
-
-                        cs.Append("0.1 0.1 0.1 rg BT /F1 8 Tf 45 " + (tableY + 4) + " Td (" + (v + 1) + ") Tj 65 " + (tableY + 4) + " Td (" + EscapePdf(vName) + ") Tj 220 " + (tableY + 4) + " Td (" + $"{vp.visibleTriangles:N0}" + ") Tj 310 " + (tableY + 4) + " Td (" + $"{vp.visibleVertices:N0}" + ") Tj 390 " + (tableY + 4) + " Td (" + vp.uniqueMaterialsCount + ") Tj 440 " + (tableY + 4) + " Td (" + vp.visibleLightsCount + ") Tj ");
-                        if (vp.isOverBudget) cs.Append("/F2 8 Tf 0.8 0.1 0.1 rg ");
-                        else cs.Append("/F1 8 Tf 0.1 0.5 0.1 rg ");
-                        cs.Append("490 " + (tableY + 4) + " Td (" + statStr + ") Tj ET\n");
-                    }
-                }
-
-                // Footer
-                cs.Append("0.5 0.5 0.5 rg BT /F1 7.5 Tf 40 30 Td (Generated by Live Scene Auditor v1.0 | " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + ") Tj ET\n");
-
-                byte[] streamBytes = Encoding.ASCII.GetBytes(cs.ToString());
-                WriteObject($"6 0 obj\n<< /Length {streamBytes.Length} >>\nstream\n{cs}endstream\nendobj\n");
 
                 // Cross-reference table
                 writer.Flush();

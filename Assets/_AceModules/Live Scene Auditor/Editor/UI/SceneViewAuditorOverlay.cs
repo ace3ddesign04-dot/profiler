@@ -79,7 +79,7 @@ namespace AceModules.LiveSceneAuditor
             if (sceneView != null && sceneView.camera != null)
             {
                 Transform svCamT = sceneView.camera.transform;
-                if ((svCamT.position - _lastSceneCamPos).sqrMagnitude > 0.001f || Quaternion.Angle(svCamT.rotation, _lastSceneCamRot) > 0.2f)
+                if ((svCamT.position - _lastSceneCamPos).sqrMagnitude > 0.0005f || Quaternion.Angle(svCamT.rotation, _lastSceneCamRot) > 0.15f)
                 {
                     _lastSceneCamPos = svCamT.position;
                     _lastSceneCamRot = svCamT.rotation;
@@ -220,6 +220,11 @@ namespace AceModules.LiveSceneAuditor
                     statusColor = AuditorUIStyles.ColorDanger;
                     statusTitle = $"● Over ({report.overallHealthPercentage}%)";
                 }
+                else if (report.overallHealthPercentage >= 100f)
+                {
+                    statusColor = AuditorUIStyles.ColorWarning;
+                    statusTitle = $"● Full ({report.overallHealthPercentage}%)";
+                }
                 else if (report.overallHealthPercentage >= 75f)
                 {
                     statusColor = AuditorUIStyles.ColorWarning;
@@ -323,6 +328,8 @@ namespace AceModules.LiveSceneAuditor
             EditorGUILayout.EndVertical();
         }
 
+        private static bool _pendingRescanAfterCurrentScan = false;
+
         private static void OnEditorUpdate()
         {
             double now = EditorApplication.timeSinceStartup;
@@ -337,6 +344,9 @@ namespace AceModules.LiveSceneAuditor
 
             if (dt <= 0f || dt > 1f) dt = 0.033f;
 
+            // Watchdog check: ensure IsScanning never hangs indefinitely
+            LiveSceneAuditorWindow.CheckScanWatchdog();
+
             // Trigger initial scan if needed once scene is loaded
             if (!_initialScanDone && !EditorApplication.isCompiling && !EditorApplication.isUpdating)
             {
@@ -347,20 +357,8 @@ namespace AceModules.LiveSceneAuditor
                 }
             }
 
-            if (LiveSceneAuditorWindow.IsScanning) return;
-
-            // Handle Interval mode in background
-            if (LiveSceneAuditorWindow.CurrentScanMode == LiveSceneAuditorWindow.ScanMode.Interval)
-            {
-                LiveSceneAuditorWindow.BackgroundIntervalTimer -= dt;
-                if (LiveSceneAuditorWindow.BackgroundIntervalTimer <= 0f)
-                {
-                    LiveSceneAuditorWindow.BackgroundIntervalTimer = LiveSceneAuditorWindow.ScanIntervalSeconds;
-                    LiveSceneAuditorWindow.RequestScan(LiveSceneAuditorWindow.AutoScope == LiveSceneAuditorWindow.ScanScope.EntireScene);
-                }
-            }
-            // Handle OnChange debounce in background
-            else if (LiveSceneAuditorWindow.CurrentScanMode == LiveSceneAuditorWindow.ScanMode.OnChange)
+            // Always tick OnChange debounce timer down, even if a scan is currently in flight!
+            if (LiveSceneAuditorWindow.CurrentScanMode == LiveSceneAuditorWindow.ScanMode.OnChange)
             {
                 if (LiveSceneAuditorWindow.BackgroundChangeDebounceTimer > 0f)
                 {
@@ -368,8 +366,35 @@ namespace AceModules.LiveSceneAuditor
                     if (LiveSceneAuditorWindow.BackgroundChangeDebounceTimer <= 0f)
                     {
                         LiveSceneAuditorWindow.BackgroundChangeDebounceTimer = -1f;
-                        LiveSceneAuditorWindow.RequestScan(LiveSceneAuditorWindow.AutoScope == LiveSceneAuditorWindow.ScanScope.EntireScene);
+                        if (LiveSceneAuditorWindow.IsScanning)
+                        {
+                            // A scan is currently running in background; queue an updated rescan as soon as it finishes
+                            _pendingRescanAfterCurrentScan = true;
+                        }
+                        else
+                        {
+                            _pendingRescanAfterCurrentScan = false;
+                            LiveSceneAuditorWindow.RequestScan(LiveSceneAuditorWindow.AutoScope == LiveSceneAuditorWindow.ScanScope.EntireScene);
+                        }
                     }
+                }
+            }
+
+            // If a previous scan finished and an updated scan was queued while it ran, dispatch it immediately!
+            if (!LiveSceneAuditorWindow.IsScanning && _pendingRescanAfterCurrentScan)
+            {
+                _pendingRescanAfterCurrentScan = false;
+                LiveSceneAuditorWindow.RequestScan(LiveSceneAuditorWindow.AutoScope == LiveSceneAuditorWindow.ScanScope.EntireScene);
+            }
+
+            // Handle Interval mode in background
+            if (!LiveSceneAuditorWindow.IsScanning && LiveSceneAuditorWindow.CurrentScanMode == LiveSceneAuditorWindow.ScanMode.Interval)
+            {
+                LiveSceneAuditorWindow.BackgroundIntervalTimer -= dt;
+                if (LiveSceneAuditorWindow.BackgroundIntervalTimer <= 0f)
+                {
+                    LiveSceneAuditorWindow.BackgroundIntervalTimer = LiveSceneAuditorWindow.ScanIntervalSeconds;
+                    LiveSceneAuditorWindow.RequestScan(LiveSceneAuditorWindow.AutoScope == LiveSceneAuditorWindow.ScanScope.EntireScene);
                 }
             }
         }
@@ -421,7 +446,7 @@ namespace AceModules.LiveSceneAuditor
         {
             float animCurrent = AuditorUIStyles.GetAnimatedValue("Overlay_" + label, current);
             float ratio = max > 0 ? (animCurrent / max) : 0f;
-            Color barColor = ratio >= 1.0f ? AuditorUIStyles.ColorDanger : (ratio >= 0.75f ? AuditorUIStyles.ColorWarning : AuditorUIStyles.ColorGood);
+            Color barColor = ratio > 1.0f ? AuditorUIStyles.ColorDanger : (ratio >= 0.75f ? AuditorUIStyles.ColorWarning : AuditorUIStyles.ColorGood);
 
             Rect rowRect = GUILayoutUtility.GetRect(100, 16, GUILayout.ExpandWidth(true));
 

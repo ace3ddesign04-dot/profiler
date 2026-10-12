@@ -45,7 +45,7 @@ namespace AceModules.LiveSceneAuditor
             public List<string> usedInMaterials;
         }
 
-        private struct MaterialSnapshot
+        private class MaterialSnapshot
         {
             public int materialInstanceId;
             public string materialName;
@@ -103,8 +103,60 @@ namespace AceModules.LiveSceneAuditor
             public float fov;
         }
 
+        // ==========================================
+        // HIGH PERFORMANCE O(1) ASSET & MESH CACHES
+        // ==========================================
+        private struct CachedMeshData
+        {
+            public int triCount;
+            public int vertCount;
+            public string assetPath;
+            public string fbxName;
+            public bool isModelAsset;
+        }
+
+        private struct CachedTextureData
+        {
+            public int instanceId;
+            public string name;
+            public int width;
+            public int height;
+            public float score;
+        }
+
+        private struct CachedMaterialData
+        {
+            public int instanceId;
+            public string name;
+            public string shaderName;
+            public List<int> textureInstanceIds;
+            public List<string> textureNames;
+            public int mainTexId;
+            public string mainTexName;
+            public int mainTexWidth;
+            public int mainTexHeight;
+            public float mainTexScore;
+        }
+
+        private static readonly Dictionary<int, CachedMeshData> _meshCache = new Dictionary<int, CachedMeshData>();
+        private static readonly Dictionary<int, CachedTextureData> _textureCache = new Dictionary<int, CachedTextureData>();
+        private static readonly Dictionary<int, CachedMaterialData> _materialCache = new Dictionary<int, CachedMaterialData>();
+
+        /// <summary>
+        /// Clears all cached mesh geometry and material reflection data.
+        /// Automatically called when scene assets or properties change.
+        /// </summary>
+        public static void ClearCaches()
+        {
+            _meshCache.Clear();
+            _textureCache.Clear();
+            _materialCache.Clear();
+        }
+
         private static CancellationTokenSource _activeCts;
         private static SynchronizationContext _mainThreadContext;
+        private static readonly System.Collections.Concurrent.ConcurrentQueue<Action> _mainThreadDispatchQueue = new System.Collections.Concurrent.ConcurrentQueue<Action>();
+        private static long _activeScanGen = 0;
 
         private static int _lastGameCameraTris = 0;
         private static int _lastGameCameraVerts = 0;
@@ -115,6 +167,75 @@ namespace AceModules.LiveSceneAuditor
             _mainThreadContext = SynchronizationContext.Current;
             Camera.onPostRender -= OnGlobalPostRender;
             Camera.onPostRender += OnGlobalPostRender;
+
+            // Register main thread dispatch pump on Editor updates
+            EditorApplication.update -= ProcessMainThreadDispatchQueue;
+            EditorApplication.update += ProcessMainThreadDispatchQueue;
+
+            // Invalidate caches when project assets change, reimport, or undo/redo occurs
+            EditorApplication.projectChanged -= ClearCaches;
+            EditorApplication.projectChanged += ClearCaches;
+
+            Undo.undoRedoPerformed -= ClearCaches;
+            Undo.undoRedoPerformed += ClearCaches;
+
+            Undo.postprocessModifications -= OnPostprocessModifications;
+            Undo.postprocessModifications += OnPostprocessModifications;
+
+            UnityEditor.SceneManagement.EditorSceneManager.activeSceneChangedInEditMode -= OnActiveSceneChanged;
+            UnityEditor.SceneManagement.EditorSceneManager.activeSceneChangedInEditMode += OnActiveSceneChanged;
+
+            AssemblyReloadEvents.beforeAssemblyReload -= CleanupViewpointCamera;
+            AssemblyReloadEvents.beforeAssemblyReload += CleanupViewpointCamera;
+
+            EditorApplication.quitting -= CleanupViewpointCamera;
+            EditorApplication.quitting += CleanupViewpointCamera;
+        }
+
+        public static void ProcessMainThreadDispatchQueue()
+        {
+            while (_mainThreadDispatchQueue.TryDequeue(out var action))
+            {
+                try
+                {
+                    action?.Invoke();
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogError($"[Live Scene Auditor] Dispatch queue error: {ex}");
+                }
+            }
+        }
+
+        public static void CancelCurrentScan()
+        {
+            Interlocked.Increment(ref _activeScanGen);
+            if (_activeCts != null)
+            {
+                try { _activeCts.Cancel(); } catch {}
+                try { _activeCts.Dispose(); } catch {}
+                _activeCts = null;
+            }
+        }
+
+        private static void CleanupViewpointCamera()
+        {
+            if (_persistentViewpointCam != null && _persistentViewpointCam.gameObject != null)
+            {
+                UnityEngine.Object.DestroyImmediate(_persistentViewpointCam.gameObject);
+                _persistentViewpointCam = null;
+            }
+        }
+
+        private static void OnActiveSceneChanged(UnityEngine.SceneManagement.Scene s1, UnityEngine.SceneManagement.Scene s2)
+        {
+            ClearCaches();
+        }
+
+        private static UndoPropertyModification[] OnPostprocessModifications(UndoPropertyModification[] modifications)
+        {
+            ClearCaches();
+            return modifications;
         }
 
         private static void OnGlobalPostRender(Camera cam)
@@ -145,36 +266,51 @@ namespace AceModules.LiveSceneAuditor
             catch {}
         }
 
+        private static Camera _persistentViewpointCam;
+
+        private static Camera GetOrCreateViewpointCamera()
+        {
+            if (_persistentViewpointCam == null)
+            {
+                GameObject go = EditorUtility.CreateGameObjectWithHideFlags(
+                    "__Auditor_PersistentViewCam", 
+                    HideFlags.HideAndDontSave, 
+                    typeof(Camera));
+                _persistentViewpointCam = go.GetComponent<Camera>();
+                _persistentViewpointCam.enabled = false;
+                _persistentViewpointCam.cullingMask = 0;
+            }
+            return _persistentViewpointCam;
+        }
+
         private static List<ViewpointSnapshot> CaptureViewpointSnapshots(List<Transform> viewpoints, Camera refCam)
         {
             List<ViewpointSnapshot> list = new List<ViewpointSnapshot>();
             if (viewpoints == null || viewpoints.Count == 0) return list;
 
-            GameObject tempCamGo = null;
-            Camera tempCam = null;
-
             try
             {
-                tempCamGo = new GameObject("__Auditor_TempViewpointCam") { hideFlags = HideFlags.HideAndDontSave };
-                tempCam = tempCamGo.AddComponent<Camera>();
+                Camera cam = GetOrCreateViewpointCamera();
                 if (refCam != null)
                 {
-                    tempCam.CopyFrom(refCam);
+                    cam.CopyFrom(refCam);
                 }
                 else
                 {
-                    tempCam.fieldOfView = 60f;
-                    tempCam.nearClipPlane = 0.3f;
-                    tempCam.farClipPlane = 1000f;
+                    cam.fieldOfView = 60f;
+                    cam.nearClipPlane = 0.3f;
+                    cam.farClipPlane = 1000f;
                 }
+                cam.enabled = false;
+                cam.cullingMask = 0;
 
                 foreach (var vp in viewpoints)
                 {
                     if (vp == null) continue;
-                    tempCam.transform.position = vp.position;
-                    tempCam.transform.rotation = vp.rotation;
+                    cam.transform.position = vp.position;
+                    cam.transform.rotation = vp.rotation;
 
-                    Plane[] planes = GeometryUtility.CalculateFrustumPlanes(tempCam);
+                    Plane[] planes = GeometryUtility.CalculateFrustumPlanes(cam);
                     list.Add(new ViewpointSnapshot
                     {
                         name = vp.name,
@@ -182,20 +318,13 @@ namespace AceModules.LiveSceneAuditor
                         position = vp.position,
                         rotationEuler = vp.rotation.eulerAngles,
                         frustumPlanes = planes,
-                        fov = tempCam.fieldOfView
+                        fov = cam.fieldOfView
                     });
                 }
             }
             catch (Exception ex)
             {
                 Debug.LogWarning($"[Live Scene Auditor] Failed to capture viewpoint frustums: {ex.Message}");
-            }
-            finally
-            {
-                if (tempCamGo != null)
-                {
-                    UnityEngine.Object.DestroyImmediate(tempCamGo);
-                }
             }
 
             return list;
@@ -221,11 +350,12 @@ namespace AceModules.LiveSceneAuditor
 
             Stopwatch sw = Stopwatch.StartNew();
 
-            // Cancel any pending async scan
+            // Increment scan generation and cancel any pending async scan
+            long thisScanGen = Interlocked.Increment(ref _activeScanGen);
             if (_activeCts != null)
             {
-                _activeCts.Cancel();
-                _activeCts.Dispose();
+                try { _activeCts.Cancel(); } catch {}
+                try { _activeCts.Dispose(); } catch {}
                 _activeCts = null;
             }
 
@@ -240,9 +370,7 @@ namespace AceModules.LiveSceneAuditor
                 targetCamera = Camera.main != null ? Camera.main : (SceneView.lastActiveSceneView != null ? SceneView.lastActiveSceneView.camera : null);
             }
             CameraSnapshot camSnap = CaptureCameraSnapshot(targetCamera, isGameCamera);
-            List<RendererSnapshot> renderers = CaptureRenderersSnapshot(includeInactive, camSnap, out int fbxCount);
-            List<TextureSnapshot> textures = CaptureTexturesSnapshot();
-            List<MaterialSnapshot> materials = CaptureMaterialsSnapshot(includeInactive, camSnap);
+            CaptureSceneRenderData(includeInactive, camSnap, out List<RendererSnapshot> renderers, out List<TextureSnapshot> textures, out List<MaterialSnapshot> materials, out int fbxCount);
             List<LightSnapshot> lights = CaptureLightsSnapshot(includeInactive, camSnap);
             List<ViewpointSnapshot> viewpointSnaps = CaptureViewpointSnapshots(viewpoints, targetCamera);
 
@@ -256,51 +384,68 @@ namespace AceModules.LiveSceneAuditor
             }
             else
             {
-                // Asynchronous background processing
+                // Asynchronous background processing with generation-safe dispatch
                 _activeCts = new CancellationTokenSource();
                 CancellationToken token = _activeCts.Token;
+                if (_mainThreadContext == null || SynchronizationContext.Current != null)
+                {
+                    _mainThreadContext = SynchronizationContext.Current ?? _mainThreadContext;
+                }
                 SynchronizationContext context = _mainThreadContext;
 
                 Task.Run(() =>
                 {
                     try
                     {
-                        if (token.IsCancellationRequested) return;
+                        if (token.IsCancellationRequested || thisScanGen != Interlocked.Read(ref _activeScanGen))
+                        {
+                            return;
+                        }
 
                         SceneAuditReport report = ProcessSnapshot(renderers, textures, materials, lights, camSnap, frustumOnly, profile, fbxCount, viewpointSnaps);
                         sw.Stop();
                         report.scanDurationMs = (float)sw.Elapsed.TotalMilliseconds;
 
-                        if (!token.IsCancellationRequested)
+                        if (token.IsCancellationRequested || thisScanGen != Interlocked.Read(ref _activeScanGen))
                         {
-                            if (context != null)
+                            return;
+                        }
+
+                        _mainThreadDispatchQueue.Enqueue(() =>
+                        {
+                            if (thisScanGen == Interlocked.Read(ref _activeScanGen))
                             {
-                                context.Post(_ =>
-                                {
-                                    if (!token.IsCancellationRequested)
-                                    {
-                                        onCompleted?.Invoke(report);
-                                    }
-                                }, null);
+                                onCompleted?.Invoke(report);
                             }
-                            else
+                        });
+
+                        if (context != null)
+                        {
+                            try
                             {
-                                EditorApplication.delayCall += () =>
-                                {
-                                    if (!token.IsCancellationRequested)
-                                    {
-                                        onCompleted?.Invoke(report);
-                                    }
-                                };
+                                context.Post(_ => ProcessMainThreadDispatchQueue(), null);
                             }
+                            catch {}
                         }
                     }
                     catch (Exception ex)
                     {
                         Debug.LogError($"[Live Scene Auditor] Error during async scan: {ex}");
+                        _mainThreadDispatchQueue.Enqueue(() =>
+                        {
+                            if (thisScanGen == Interlocked.Read(ref _activeScanGen))
+                            {
+                                onCompleted?.Invoke(null);
+                            }
+                        });
+
                         if (context != null)
                         {
-                            context.Post(_ => onCompleted?.Invoke(null), null);
+                            try
+                            {
+                                context.Post(_ => ProcessMainThreadDispatchQueue(), null);
+                            }
+                            catch {}
                         }
                     }
                 }, token);
@@ -335,160 +480,354 @@ namespace AceModules.LiveSceneAuditor
             return snap;
         }
 
-        private static List<RendererSnapshot> CaptureRenderersSnapshot(bool includeInactive, CameraSnapshot camSnap, out int fbxCount)
+        private static Mesh GetRendererSharedMesh(Renderer r)
         {
-            List<RendererSnapshot> list = new List<RendererSnapshot>();
-            HashSet<string> uniqueFbxPaths = new HashSet<string>();
+            if (r is MeshRenderer)
+            {
+                MeshFilter mf = r.GetComponent<MeshFilter>();
+                return mf != null ? mf.sharedMesh : null;
+            }
+            if (r is SkinnedMeshRenderer smr)
+            {
+                return smr.sharedMesh;
+            }
+            return null;
+        }
 
-            // Identify LOD groups first with strict active and inactive sets
+        private static CachedMeshData GetOrComputeMeshData(Mesh mesh)
+        {
+            if (mesh == null) return default;
+            int id = mesh.GetInstanceID();
+            if (_meshCache.TryGetValue(id, out var data))
+            {
+                return data;
+            }
+
+            string path = AssetDatabase.GetAssetPath(mesh);
+            bool isModel = !string.IsNullOrEmpty(path) && IsModelAssetPath(path);
+            string fbxName = isModel ? System.IO.Path.GetFileNameWithoutExtension(path) : "";
+
+            int triCount = 0;
+            try
+            {
+                int subMeshCount = mesh.subMeshCount;
+                for (int s = 0; s < subMeshCount; s++)
+                {
+                    triCount += (int)(mesh.GetIndexCount(s) / 3);
+                }
+            }
+            catch
+            {
+                triCount = 0;
+            }
+
+            int vertCount = 0;
+            try
+            {
+                vertCount = mesh.vertexCount;
+            }
+            catch {}
+
+            data = new CachedMeshData
+            {
+                triCount = triCount,
+                vertCount = vertCount,
+                assetPath = path ?? "",
+                fbxName = fbxName ?? "",
+                isModelAsset = isModel
+            };
+
+            _meshCache[id] = data;
+            return data;
+        }
+
+        private static CachedMaterialData GetOrComputeMaterialData(Material mat)
+        {
+            if (mat == null) return default;
+            int id = mat.GetInstanceID();
+            if (_materialCache.TryGetValue(id, out var data))
+            {
+                return data;
+            }
+
+            string shaderName = "Standard";
+            try
+            {
+                if (mat.shader != null) shaderName = mat.shader.name;
+            }
+            catch {}
+
+            List<int> texIds = new List<int>();
+            List<string> texNames = new List<string>();
+            HashSet<int> seenTex = new HashSet<int>();
+
+            try
+            {
+                string[] propNames = mat.GetTexturePropertyNames();
+                if (propNames != null)
+                {
+                    foreach (var prop in propNames)
+                    {
+                        Texture tex = mat.GetTexture(prop);
+                        if (tex != null && !IsIgnoredAsset(tex) && seenTex.Add(tex.GetInstanceID()))
+                        {
+                            int tId = tex.GetInstanceID();
+                            texIds.Add(tId);
+                            texNames.Add(tex.name);
+
+                            if (!_textureCache.ContainsKey(tId))
+                            {
+                                float score = ((float)tex.width / 512f) * ((float)tex.height / 512f);
+                                _textureCache[tId] = new CachedTextureData
+                                {
+                                    instanceId = tId,
+                                    name = tex.name,
+                                    width = tex.width,
+                                    height = tex.height,
+                                    score = score
+                                };
+                            }
+                        }
+                    }
+                }
+            }
+            catch {}
+
+            Texture mainTex = null;
+            try { mainTex = mat.mainTexture; } catch {}
+            if (mainTex == null)
+            {
+                try
+                {
+                    if (mat.HasProperty("_BaseMap")) mainTex = mat.GetTexture("_BaseMap");
+                    else if (mat.HasProperty("_MainTex")) mainTex = mat.GetTexture("_MainTex");
+                }
+                catch {}
+            }
+
+            int mainTexId = 0;
+            string mainTexName = "(No Texture / Flat Color)";
+            int mainTexW = 0;
+            int mainTexH = 0;
+            float mainTexScore = 0f;
+
+            if (mainTex != null && !IsIgnoredAsset(mainTex))
+            {
+                mainTexId = mainTex.GetInstanceID();
+                mainTexName = mainTex.name;
+                mainTexW = mainTex.width;
+                mainTexH = mainTex.height;
+                mainTexScore = ((float)mainTex.width / 512f) * ((float)mainTex.height / 512f);
+
+                if (!_textureCache.ContainsKey(mainTexId))
+                {
+                    _textureCache[mainTexId] = new CachedTextureData
+                    {
+                        instanceId = mainTexId,
+                        name = mainTexName,
+                        width = mainTexW,
+                        height = mainTexH,
+                        score = mainTexScore
+                    };
+                }
+            }
+
+            data = new CachedMaterialData
+            {
+                instanceId = id,
+                name = mat.name,
+                shaderName = shaderName,
+                textureInstanceIds = texIds,
+                textureNames = texNames,
+                mainTexId = mainTexId,
+                mainTexName = mainTexName,
+                mainTexWidth = mainTexW,
+                mainTexHeight = mainTexH,
+                mainTexScore = mainTexScore
+            };
+
+            _materialCache[id] = data;
+            return data;
+        }
+
+        private static void CaptureSceneRenderData(
+            bool includeInactive, 
+            CameraSnapshot camSnap,
+            out List<RendererSnapshot> renderers,
+            out List<TextureSnapshot> textures,
+            out List<MaterialSnapshot> materials,
+            out int fbxCount)
+        {
+            renderers = new List<RendererSnapshot>();
+            textures = new List<TextureSnapshot>();
+            materials = new List<MaterialSnapshot>();
+            fbxCount = 0;
+
+            // 1. Identify LOD groups first with strict active and inactive sets
             LODGroup[] lodGroups = GameObject.FindObjectsOfType<LODGroup>(includeInactive);
             HashSet<Renderer> activeLodRenderers = new HashSet<Renderer>();
             HashSet<Renderer> inactiveLodRenderers = new HashSet<Renderer>();
 
-            foreach (var lodGroup in lodGroups)
+            if (lodGroups != null && lodGroups.Length > 0)
             {
-                if (lodGroup == null) continue;
-                LOD[] lods = lodGroup.GetLODs();
-                if (lods == null || lods.Length == 0) continue;
-
-                // Determine active LOD based on accurate screen coverage metric
-                int activeLodIndex = -1; // -1 means completely culled by LOD distance
-                if (camSnap.isValid)
+                foreach (var lodGroup in lodGroups)
                 {
-                    Vector3 lodCenter = lodGroup.transform.TransformPoint(lodGroup.localReferencePoint);
-                    float distance = Vector3.Distance(camSnap.position, lodCenter);
-                    float halfFovRad = (camSnap.fov * 0.5f) * Mathf.Deg2Rad;
-                    float screenRelativeMetric = (lodGroup.size * QualitySettings.lodBias) / (Mathf.Max(0.01f, distance) * 2.0f * Mathf.Tan(halfFovRad));
+                    if (lodGroup == null) continue;
+                    LOD[] lods = lodGroup.GetLODs();
+                    if (lods == null || lods.Length == 0) continue;
+
+                    int activeLodIndex = -1;
+                    if (camSnap.isValid)
+                    {
+                        Vector3 lodCenter = lodGroup.transform.TransformPoint(lodGroup.localReferencePoint);
+                        float distance = Vector3.Distance(camSnap.position, lodCenter);
+                        float halfFovRad = (camSnap.fov * 0.5f) * Mathf.Deg2Rad;
+                        float screenRelativeMetric = (lodGroup.size * QualitySettings.lodBias) / (Mathf.Max(0.01f, distance) * 2.0f * Mathf.Tan(halfFovRad));
+
+                        for (int i = 0; i < lods.Length; i++)
+                        {
+                            if (screenRelativeMetric >= lods[i].screenRelativeTransitionHeight)
+                            {
+                                activeLodIndex = i;
+                                break;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        activeLodIndex = 0;
+                    }
 
                     for (int i = 0; i < lods.Length; i++)
                     {
-                        if (screenRelativeMetric >= lods[i].screenRelativeTransitionHeight)
+                        bool isActive = (i == activeLodIndex);
+                        foreach (var r in lods[i].renderers)
                         {
-                            activeLodIndex = i;
-                            break;
-                        }
-                    }
-                }
-                else
-                {
-                    activeLodIndex = 0; // Default to LOD0 if no camera
-                }
-
-                for (int i = 0; i < lods.Length; i++)
-                {
-                    bool isActive = (i == activeLodIndex);
-                    foreach (var r in lods[i].renderers)
-                    {
-                        if (r == null) continue;
-                        if (isActive)
-                        {
-                            activeLodRenderers.Add(r);
-                        }
-                        else
-                        {
-                            inactiveLodRenderers.Add(r);
+                            if (r == null) continue;
+                            if (isActive) activeLodRenderers.Add(r);
+                            else inactiveLodRenderers.Add(r);
                         }
                     }
                 }
             }
 
-            // Pass 1: Build scene-wide FBX model occurrence mapping across ALL scene objects
+            // 2. Query ALL scene renderers EXACTLY ONCE across the entire scan
             Renderer[] allSceneRenderers = GameObject.FindObjectsOfType<Renderer>(true);
-            Dictionary<string, HashSet<int>> fbxToAllSceneRootIds = new Dictionary<string, HashSet<int>>(StringComparer.OrdinalIgnoreCase);
+            if (allSceneRenderers == null || allSceneRenderers.Length == 0) return;
 
+            HashSet<string> uniqueFbxPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            Dictionary<string, HashSet<int>> fbxToAllSceneRootIds = new Dictionary<string, HashSet<int>>(StringComparer.OrdinalIgnoreCase);
+            Dictionary<int, int> goRootIdMap = new Dictionary<int, int>();
+            Dictionary<int, HashSet<string>> texToMaterials = new Dictionary<int, HashSet<string>>();
+
+            // PASS 1: Build FBX occurrence mapping and populate mesh/material/texture caches
             foreach (var r in allSceneRenderers)
             {
                 if (r == null || IsIgnoredRenderer(r)) continue;
 
-                Mesh m = null;
-                if (r is MeshRenderer)
+                Mesh m = GetRendererSharedMesh(r);
+                if (m != null)
                 {
-                    MeshFilter mf = r.GetComponent<MeshFilter>();
-                    if (mf != null) m = mf.sharedMesh;
-                }
-                else if (r is SkinnedMeshRenderer smr)
-                {
-                    m = smr.sharedMesh;
-                }
-
-                if (m == null) continue;
-
-                string path = AssetDatabase.GetAssetPath(m);
-                if (!string.IsNullOrEmpty(path) && IsModelAssetPath(path))
-                {
-                    uniqueFbxPaths.Add(path);
-
-                    if (!fbxToAllSceneRootIds.TryGetValue(path, out var rootSet))
+                    CachedMeshData meshData = GetOrComputeMeshData(m);
+                    if (meshData.isModelAsset && !string.IsNullOrEmpty(meshData.assetPath))
                     {
-                        rootSet = new HashSet<int>();
-                        fbxToAllSceneRootIds[path] = rootSet;
-                    }
+                        uniqueFbxPaths.Add(meshData.assetPath);
 
-                    GameObject rootGo = PrefabUtility.GetNearestPrefabInstanceRoot(r.gameObject);
-                    if (rootGo == null) rootGo = r.gameObject;
-                    rootSet.Add(rootGo.GetInstanceID());
+                        if (!fbxToAllSceneRootIds.TryGetValue(meshData.assetPath, out var rootSet))
+                        {
+                            rootSet = new HashSet<int>();
+                            fbxToAllSceneRootIds[meshData.assetPath] = rootSet;
+                        }
+
+                        int goId = r.gameObject.GetInstanceID();
+                        if (!goRootIdMap.TryGetValue(goId, out int rootId))
+                        {
+                            GameObject rootGo = PrefabUtility.GetNearestPrefabInstanceRoot(r.gameObject);
+                            rootId = rootGo != null ? rootGo.GetInstanceID() : goId;
+                            goRootIdMap[goId] = rootId;
+                        }
+
+                        rootSet.Add(rootId);
+                    }
+                }
+
+                // Gather all textures used across all scene materials (for scene-wide texture memory audit)
+                Material[] mats = r.sharedMaterials;
+                if (mats != null)
+                {
+                    foreach (var mat in mats)
+                    {
+                        if (mat == null || IsIgnoredAsset(mat)) continue;
+                        CachedMaterialData matData = GetOrComputeMaterialData(mat);
+                        for (int t = 0; t < matData.textureInstanceIds.Count; t++)
+                        {
+                            int tId = matData.textureInstanceIds[t];
+                            if (!texToMaterials.TryGetValue(tId, out var matSet))
+                            {
+                                matSet = new HashSet<string>();
+                                texToMaterials[tId] = matSet;
+                            }
+                            matSet.Add(matData.name);
+                        }
+                    }
                 }
             }
 
-            // Collect all MeshRenderers & SkinnedMeshRenderers according to includeInactive
-            Renderer[] allRenderers = GameObject.FindObjectsOfType<Renderer>(includeInactive);
+            fbxCount = uniqueFbxPaths.Count;
 
-            foreach (var r in allRenderers)
+            // Build TextureSnapshots list
+            foreach (var kvp in texToMaterials)
             {
-                if (r == null || !r.enabled || (!r.gameObject.activeInHierarchy && !includeInactive))
-                    continue;
-
-                // Ignore TextMeshPro and Canvas/UI components
-                if (IsIgnoredRenderer(r))
-                    continue;
-
-                Mesh mesh = null;
-                if (r is MeshRenderer)
+                int texId = kvp.Key;
+                if (_textureCache.TryGetValue(texId, out CachedTextureData texData))
                 {
-                    MeshFilter mf = r.GetComponent<MeshFilter>();
-                    if (mf != null) mesh = mf.sharedMesh;
+                    textures.Add(new TextureSnapshot
+                    {
+                        instanceId = texData.instanceId,
+                        name = texData.name,
+                        width = texData.width,
+                        height = texData.height,
+                        score = texData.score,
+                        usedInMaterials = kvp.Value.ToList()
+                    });
                 }
-                else if (r is SkinnedMeshRenderer smr)
-                {
-                    mesh = smr.sharedMesh;
-                }
+            }
 
+            // PASS 2: Collect active Renderers and Materials according to includeInactive and LODs
+            Dictionary<int, MaterialSnapshot> matMap = new Dictionary<int, MaterialSnapshot>();
+
+            foreach (var r in allSceneRenderers)
+            {
+                if (r == null || !r.enabled) continue;
+                if (!r.gameObject.activeInHierarchy && !includeInactive) continue;
+                if (IsIgnoredRenderer(r)) continue;
+
+                Mesh mesh = GetRendererSharedMesh(r);
                 if (mesh == null) continue;
 
-                string assetPath = AssetDatabase.GetAssetPath(mesh);
-                bool isModel = !string.IsNullOrEmpty(assetPath) && IsModelAssetPath(assetPath);
-                string fbxName = isModel ? System.IO.Path.GetFileNameWithoutExtension(assetPath) : "";
-                int occurrences = 0;
-                List<int> rootIds = null;
-                GameObject rootInstanceGo = PrefabUtility.GetNearestPrefabInstanceRoot(r.gameObject);
-                if (rootInstanceGo == null) rootInstanceGo = r.gameObject;
-                int rootInstanceId = rootInstanceGo.GetInstanceID();
+                CachedMeshData meshData = GetOrComputeMeshData(mesh);
 
-                if (isModel && fbxToAllSceneRootIds.TryGetValue(assetPath, out var rRoots))
-                {
-                    occurrences = rRoots.Count;
-                    rootIds = rRoots.ToList();
-                }
-
-                // Strict LOD rule: If part of an LOD group and NOT in the active set, SKIP ENTIRELY!
+                // Strict LOD rule: If part of an LOD group and NOT in the active set, skip
                 bool isPartOfLod = activeLodRenderers.Contains(r) || inactiveLodRenderers.Contains(r);
                 if (inactiveLodRenderers.Contains(r) && !activeLodRenderers.Contains(r))
                 {
-                    continue; // Skip inactive LOD meshes
+                    continue;
                 }
 
-                int triCount = 0;
-                try
+                int occurrences = 0;
+                List<int> rootIds = null;
+                int goId = r.gameObject.GetInstanceID();
+                if (!goRootIdMap.TryGetValue(goId, out int rootInstanceId))
                 {
-                    int subMeshCount = mesh.subMeshCount;
-                    for (int s = 0; s < subMeshCount; s++)
-                    {
-                        triCount += (int)(mesh.GetIndexCount(s) / 3);
-                    }
+                    GameObject rootGo = PrefabUtility.GetNearestPrefabInstanceRoot(r.gameObject);
+                    rootInstanceId = rootGo != null ? rootGo.GetInstanceID() : goId;
+                    goRootIdMap[goId] = rootInstanceId;
                 }
-                catch
+
+                if (meshData.isModelAsset && fbxToAllSceneRootIds.TryGetValue(meshData.assetPath, out var rRoots))
                 {
-                    triCount = 0;
+                    occurrences = rRoots.Count;
+                    rootIds = rRoots.ToList();
                 }
 
                 Material[] sharedMats = r.sharedMaterials;
@@ -498,44 +837,65 @@ namespace AceModules.LiveSceneAuditor
                 List<string> texNames = new List<string>();
                 HashSet<int> seenTex = new HashSet<int>();
 
+                int rId = r.gameObject.GetInstanceID();
+                string rName = r.gameObject.name;
+
                 if (sharedMats != null)
                 {
                     foreach (var m in sharedMats)
                     {
-                        if (m != null && !IsIgnoredAsset(m))
-                        {
-                            matIds.Add(m.GetInstanceID());
-                            matNames.Add(m.name);
+                        if (m == null || IsIgnoredAsset(m)) continue;
 
-                            try
+                        CachedMaterialData matData = GetOrComputeMaterialData(m);
+                        matIds.Add(matData.instanceId);
+                        matNames.Add(matData.name);
+
+                        for (int t = 0; t < matData.textureInstanceIds.Count; t++)
+                        {
+                            int tId = matData.textureInstanceIds[t];
+                            if (seenTex.Add(tId))
                             {
-                                string[] propNames = m.GetTexturePropertyNames();
-                                if (propNames != null)
-                                {
-                                    foreach (var prop in propNames)
-                                    {
-                                        Texture tex = m.GetTexture(prop);
-                                        if (tex != null && !IsIgnoredAsset(tex) && !seenTex.Contains(tex.GetInstanceID()))
-                                        {
-                                            seenTex.Add(tex.GetInstanceID());
-                                            texIds.Add(tex.GetInstanceID());
-                                            texNames.Add(tex.name);
-                                        }
-                                    }
-                                }
+                                texIds.Add(tId);
+                                texNames.Add(matData.textureNames[t]);
                             }
-                            catch {}
+                        }
+
+                        // Add to MaterialSnapshot
+                        if (!matMap.TryGetValue(matData.instanceId, out MaterialSnapshot snap))
+                        {
+                            snap = new MaterialSnapshot
+                            {
+                                materialInstanceId = matData.instanceId,
+                                materialName = matData.name,
+                                shaderName = matData.shaderName,
+                                textureInstanceId = matData.mainTexId,
+                                textureName = matData.mainTexName,
+                                textureWidth = matData.mainTexWidth,
+                                textureHeight = matData.mainTexHeight,
+                                textureScore = matData.mainTexScore,
+                                rendererInstanceIds = new List<int>(),
+                                rendererNames = new List<string>(),
+                                visibleRendererInstanceIds = new List<int>(),
+                                visibleRendererNames = new List<string>()
+                            };
+                            matMap[matData.instanceId] = snap;
+                        }
+
+                        if (!snap.rendererInstanceIds.Contains(rId))
+                        {
+                            snap.rendererInstanceIds.Add(rId);
+                            snap.rendererNames.Add(rName);
                         }
                     }
                 }
 
-                list.Add(new RendererSnapshot
+                renderers.Add(new RendererSnapshot
                 {
-                    instanceId = r.gameObject.GetInstanceID(),
-                    name = r.gameObject.name,
+                    instanceId = rId,
+                    name = rName,
                     worldBounds = r.bounds,
-                    triangleCount = triCount,
-                    vertexCount = mesh.vertexCount,
+                    triangleCount = meshData.triCount,
+                    vertexCount = meshData.vertCount,
                     isPartOfLOD = isPartOfLod,
                     isActiveLOD = true,
                     materialCount = matIds.Count,
@@ -543,162 +903,16 @@ namespace AceModules.LiveSceneAuditor
                     materialNames = matNames,
                     textureInstanceIds = texIds,
                     textureNames = texNames,
-                    isModelAsset = isModel,
-                    fbxAssetPath = isModel ? assetPath : "",
-                    fbxName = fbxName,
+                    isModelAsset = meshData.isModelAsset,
+                    fbxAssetPath = meshData.isModelAsset ? meshData.assetPath : "",
+                    fbxName = meshData.fbxName,
                     modelInstanceRootId = rootInstanceId,
                     fbxSceneOccurrences = occurrences,
                     fbxSceneRootIds = rootIds ?? new List<int>()
                 });
             }
 
-            fbxCount = uniqueFbxPaths.Count;
-            return list;
-        }
-
-        private static List<TextureSnapshot> CaptureTexturesSnapshot()
-        {
-            List<TextureSnapshot> list = new List<TextureSnapshot>();
-            HashSet<int> processedTextures = new HashSet<int>();
-
-            // Collect textures from all scene 3D renderers
-            Renderer[] allRenderers = GameObject.FindObjectsOfType<Renderer>(true);
-            foreach (var r in allRenderers)
-            {
-                if (r == null || IsIgnoredRenderer(r)) continue;
-                Material[] mats = r.sharedMaterials;
-                if (mats == null) continue;
-
-                foreach (var mat in mats)
-                {
-                    if (mat == null || IsIgnoredAsset(mat)) continue;
-
-                    try
-                    {
-                        string[] propNames = mat.GetTexturePropertyNames();
-                        if (propNames == null) continue;
-
-                        foreach (var propName in propNames)
-                        {
-                            Texture tex = mat.GetTexture(propName);
-                            if (tex != null && !IsIgnoredAsset(tex) && !processedTextures.Contains(tex.GetInstanceID()))
-                            {
-                                processedTextures.Add(tex.GetInstanceID());
-                                float score = ((float)tex.width / 512f) * ((float)tex.height / 512f);
-
-                                list.Add(new TextureSnapshot
-                                {
-                                    instanceId = tex.GetInstanceID(),
-                                    name = tex.name,
-                                    width = tex.width,
-                                    height = tex.height,
-                                    score = score,
-                                    usedInMaterials = new List<string> { mat.name }
-                                });
-                            }
-                        }
-                    }
-                    catch
-                    {
-                        // Safely skip any materials with invalid shader properties
-                    }
-                }
-            }
-
-            return list;
-        }
-
-        private static List<MaterialSnapshot> CaptureMaterialsSnapshot(bool includeInactive, CameraSnapshot camSnap)
-        {
-            List<MaterialSnapshot> list = new List<MaterialSnapshot>();
-            Dictionary<int, MaterialSnapshot> matMap = new Dictionary<int, MaterialSnapshot>();
-
-            Renderer[] allRenderers = GameObject.FindObjectsOfType<Renderer>(includeInactive);
-            foreach (var r in allRenderers)
-            {
-                if (r == null || !r.enabled || (!r.gameObject.activeInHierarchy && !includeInactive))
-                    continue;
-
-                if (IsIgnoredRenderer(r))
-                    continue;
-
-                Material[] sharedMats = r.sharedMaterials;
-                if (sharedMats == null) continue;
-
-                bool isVisibleInView = camSnap.isValid && TestPlanesAABBThreadSafe(camSnap.frustumPlanes, r.bounds);
-
-                foreach (var m in sharedMats)
-                {
-                    if (m == null || IsIgnoredAsset(m)) continue;
-
-                    int mId = m.GetInstanceID();
-                    if (!matMap.TryGetValue(mId, out MaterialSnapshot snap))
-                    {
-                        snap = new MaterialSnapshot
-                        {
-                            materialInstanceId = mId,
-                            materialName = m.name,
-                            shaderName = m.shader != null ? m.shader.name : "Standard",
-                            rendererInstanceIds = new List<int>(),
-                            rendererNames = new List<string>(),
-                            visibleRendererInstanceIds = new List<int>(),
-                            visibleRendererNames = new List<string>()
-                        };
-
-                        Texture mainTex = null;
-                        try
-                        {
-                            mainTex = m.mainTexture;
-                        }
-                        catch {}
-
-                        if (mainTex == null)
-                        {
-                            try
-                            {
-                                if (m.HasProperty("_BaseMap")) mainTex = m.GetTexture("_BaseMap");
-                                else if (m.HasProperty("_MainTex")) mainTex = m.GetTexture("_MainTex");
-                            }
-                            catch {}
-                        }
-
-                        if (mainTex != null && !IsIgnoredAsset(mainTex))
-                        {
-                            snap.textureInstanceId = mainTex.GetInstanceID();
-                            snap.textureName = mainTex.name;
-                            snap.textureWidth = mainTex.width;
-                            snap.textureHeight = mainTex.height;
-                            snap.textureScore = ((float)mainTex.width / 512f) * ((float)mainTex.height / 512f);
-                        }
-                        else
-                        {
-                            snap.textureInstanceId = 0;
-                            snap.textureName = "(No Texture / Flat Color)";
-                            snap.textureWidth = 0;
-                            snap.textureHeight = 0;
-                            snap.textureScore = 0f;
-                        }
-
-                        matMap[mId] = snap;
-                    }
-
-                    int rId = r.gameObject.GetInstanceID();
-                    if (!snap.rendererInstanceIds.Contains(rId))
-                    {
-                        snap.rendererInstanceIds.Add(rId);
-                        snap.rendererNames.Add(r.gameObject.name);
-                    }
-
-                    if (isVisibleInView && !snap.visibleRendererInstanceIds.Contains(rId))
-                    {
-                        snap.visibleRendererInstanceIds.Add(rId);
-                        snap.visibleRendererNames.Add(r.gameObject.name);
-                    }
-                }
-            }
-
-            list.AddRange(matMap.Values);
-            return list;
+            materials.AddRange(matMap.Values);
         }
 
         private static List<LightSnapshot> CaptureLightsSnapshot(bool includeInactive, CameraSnapshot camSnap)
@@ -972,6 +1186,38 @@ namespace AceModules.LiveSceneAuditor
                 }
             }
 
+            // Link visible renderers to material snapshots (performed completely off the Main Thread)
+            if (materials != null && materials.Count > 0)
+            {
+                Dictionary<int, MaterialSnapshot> matLookup = new Dictionary<int, MaterialSnapshot>(materials.Count);
+                for (int i = 0; i < materials.Count; i++)
+                {
+                    matLookup[materials[i].materialInstanceId] = materials[i];
+                }
+
+                foreach (var r in renderers)
+                {
+                    if (!r.isActiveLOD) continue;
+                    bool isVisInCam = camSnap.isValid && TestPlanesAABBThreadSafe(camSnap.frustumPlanes, r.worldBounds);
+
+                    if (isVisInCam)
+                    {
+                        for (int m = 0; m < r.materialInstanceIds.Count; m++)
+                        {
+                            int mId = r.materialInstanceIds[m];
+                            if (matLookup.TryGetValue(mId, out var matSnap))
+                            {
+                                if (!matSnap.visibleRendererInstanceIds.Contains(r.instanceId))
+                                {
+                                    matSnap.visibleRendererInstanceIds.Add(r.instanceId);
+                                    matSnap.visibleRendererNames.Add(r.name);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // Collect and rank culprits from visible renderers
             // Group FBX model assets so repeating models (like 756 coins) collapse into 1 clean row with total geometry & occurrence counts
             var fbxGroups = visibleRenderers
@@ -1187,6 +1433,32 @@ namespace AceModules.LiveSceneAuditor
             }
 
             report.textureAreaScore = totalTexScore;
+            report.totalTexturesCount = textures.Count;
+
+            // Group textures by resolution (width x height) to calculate count with respect to size
+            report.textureSizeBreakdown = textures
+                .GroupBy(t => $"{t.width}x{t.height}")
+                .Select(g =>
+                {
+                    var first = g.First();
+                    int count = g.Count();
+                    float sumScore = g.Sum(x => x.score);
+                    float pct = textures.Count > 0 ? ((float)count / textures.Count * 100f) : 0f;
+                    return new TextureSizeBucket
+                    {
+                        resolution = $"{first.width}x{first.height}",
+                        width = first.width,
+                        height = first.height,
+                        count = count,
+                        totalScore = sumScore,
+                        percentageOfTotal = pct,
+                        textureNames = g.Select(x => x.name).Distinct().ToList(),
+                        textureInstanceIds = g.Select(x => x.instanceId).ToList()
+                    };
+                })
+                .OrderByDescending(b => b.width * b.height)
+                .ThenByDescending(b => b.count)
+                .ToList();
 
             // Process Lights
             int totalLights = 0;
@@ -1400,11 +1672,15 @@ namespace AceModules.LiveSceneAuditor
             float maxRatio = Mathf.Max(triRatio, Mathf.Max(vertRatio, Mathf.Max(matRatio, Mathf.Max(texRatio, Mathf.Max(fbxRatio,
                 Mathf.Max(dirRatio, Mathf.Max(ptRatio, Mathf.Max(sptRatio, Mathf.Max(totLightRatio, shadowRatio)))))))));
             report.overallHealthPercentage = Mathf.Round(maxRatio * 100f);
-            report.isOverBudget = maxRatio >= 1.0f;
+            report.isOverBudget = maxRatio > 1.0f;
 
             if (report.isOverBudget)
             {
                 report.statusSummary = $"OVER BUDGET ({report.overallHealthPercentage}%)";
+            }
+            else if (maxRatio >= 1.0f)
+            {
+                report.statusSummary = $"FULLY USED BUDGET ({report.overallHealthPercentage}%)";
             }
             else if (maxRatio >= 0.75f)
             {
@@ -1548,8 +1824,12 @@ namespace AceModules.LiveSceneAuditor
                         Mathf.Max(vpDirRatio, Mathf.Max(vpPtRatio, Mathf.Max(vpSptRatio, Mathf.Max(vpTotLightRatio, vpShadowRatio)))))));
 
                     float vpHealthPct = Mathf.Round(vpMaxRatio * 100f);
-                    bool vpIsOver = vpMaxRatio >= 1.0f;
-                    string vpStatus = vpIsOver ? $"OVER BUDGET ({vpHealthPct:F0}%)" : (vpMaxRatio >= 0.75f ? $"WARNING ({vpHealthPct:F0}%)" : $"PASS ({vpHealthPct:F0}%)");
+                    bool vpIsOver = vpMaxRatio > 1.0f;
+                    string vpStatus = vpIsOver 
+                        ? $"OVER BUDGET ({vpHealthPct:F0}%)" 
+                        : (vpMaxRatio >= 1.0f 
+                            ? $"FULLY USED ({vpHealthPct:F0}%)" 
+                            : (vpMaxRatio >= 0.75f ? $"WARNING ({vpHealthPct:F0}%)" : $"PASS ({vpHealthPct:F0}%)"));
 
                     report.viewpointStats.Add(new ViewpointAuditStat
                     {
