@@ -30,6 +30,11 @@ namespace AceModules.LiveSceneAuditor
         private const float SnapThreshold = 50f; // Distance in pixels to snap to a corner
         private const float Margin = 15f;
 
+        private static double _lastEditorTime = 0;
+        private static bool _initialScanDone = false;
+        private static Vector3 _lastSceneCamPos;
+        private static Quaternion _lastSceneCamRot;
+
         static SceneViewAuditorOverlay()
         {
             _isEnabled = EditorPrefs.GetBool(PrefsKeyEnabled, true);
@@ -39,11 +44,20 @@ namespace AceModules.LiveSceneAuditor
             float savedX = EditorPrefs.GetFloat(PrefsKeyPosX, 20f);
             float savedY = EditorPrefs.GetFloat(PrefsKeyPosY, 30f);
             float width = _isExpanded ? 260f : 230f;
-            float height = _isExpanded ? 205f : 36f;
+            float height = _isExpanded ? 274f : 36f;
             _overlayRect = new Rect(savedX, savedY, width, height);
 
             SceneView.duringSceneGui -= OnSceneGUI;
             SceneView.duringSceneGui += OnSceneGUI;
+
+            EditorApplication.update -= OnEditorUpdate;
+            EditorApplication.update += OnEditorUpdate;
+
+            EditorApplication.hierarchyChanged -= OnHierarchyChanged;
+            EditorApplication.hierarchyChanged += OnHierarchyChanged;
+
+            Undo.postprocessModifications -= OnPostprocessModifications;
+            Undo.postprocessModifications += OnPostprocessModifications;
         }
 
         [MenuItem("Tools/Ace Modules/Toggle Scene View Overlay", false, 100)]
@@ -59,12 +73,31 @@ namespace AceModules.LiveSceneAuditor
 
         private static void OnSceneGUI(SceneView sceneView)
         {
+            LiveSceneAuditorWindow.SyncCameraNow(sceneView);
+
+            // Track camera changes in SceneView for OnChange mode
+            if (sceneView != null && sceneView.camera != null)
+            {
+                Transform svCamT = sceneView.camera.transform;
+                if ((svCamT.position - _lastSceneCamPos).sqrMagnitude > 0.001f || Quaternion.Angle(svCamT.rotation, _lastSceneCamRot) > 0.2f)
+                {
+                    _lastSceneCamPos = svCamT.position;
+                    _lastSceneCamRot = svCamT.rotation;
+
+                    if (LiveSceneAuditorWindow.CurrentScanMode == LiveSceneAuditorWindow.ScanMode.OnChange &&
+                        LiveSceneAuditorWindow.AutoScope == LiveSceneAuditorWindow.ScanScope.ViewFrustum)
+                    {
+                        LiveSceneAuditorWindow.BackgroundChangeDebounceTimer = LiveSceneAuditorWindow.ChangeDebounceDuration;
+                    }
+                }
+            }
+
             if (!_isEnabled) return;
 
             Handles.BeginGUI();
 
             float targetWidth = _isExpanded ? 260f : 230f;
-            float targetHeight = _isExpanded ? 205f : 34f;
+            float targetHeight = _isExpanded ? 274f : 34f;
             _overlayRect.width = targetWidth;
             _overlayRect.height = targetHeight;
 
@@ -227,24 +260,60 @@ namespace AceModules.LiveSceneAuditor
             {
                 EditorGUILayout.Space(4);
 
-                var profile = LiveSceneAuditorWindow.ActiveProfile ?? BudgetProfile.GetDefaultLowEnd();
+                var profile = LiveSceneAuditorWindow.ActiveProfile ?? BudgetProfile.GetDefault();
 
                 int maxTris = profile.maxTriangles;
                 int maxVerts = profile.maxVertices;
-                int maxBatches = profile.maxBatches;
+                int maxMats = profile.maxMaterialsInScene;
                 float maxTex = profile.maxTextureScore;
+                int maxLights = profile.maxTotalLights;
 
                 int curTris = report != null ? report.visibleTriangles : 0;
                 int curVerts = report != null ? report.visibleVertices : 0;
-                int curBatches = report != null ? report.estimatedBatches : 0;
+                int curMats = report != null ? report.uniqueMaterialsCount : 0;
                 float curTex = report != null ? report.textureAreaScore : 0f;
+                int curLights = report != null ? report.totalLightsCount : 0;
 
                 DrawMiniBar("Tris", curTris, maxTris);
                 DrawMiniBar("Verts", curVerts, maxVerts);
-                DrawMiniBar("Batches", curBatches, maxBatches);
+                DrawMiniBar("Materials", curMats, maxMats);
                 DrawMiniBar("Tex Score", curTex, maxTex);
+                DrawMiniBar("Lights", curLights, maxLights);
 
                 EditorGUILayout.Space(4);
+
+                // Mode Row (Persistent)
+                EditorGUILayout.BeginHorizontal();
+                EditorGUILayout.LabelField("Mode:", EditorStyles.miniBoldLabel, GUILayout.Width(38));
+                string[] modeNames = { "Manual", "On Change", "Interval" };
+                EditorGUI.BeginChangeCheck();
+                var newMode = (LiveSceneAuditorWindow.ScanMode)EditorGUILayout.Popup((int)LiveSceneAuditorWindow.CurrentScanMode, modeNames, EditorStyles.miniButton, GUILayout.Width(88));
+                if (EditorGUI.EndChangeCheck())
+                {
+                    LiveSceneAuditorWindow.CurrentScanMode = newMode;
+                    LiveSceneAuditorWindow.BackgroundIntervalTimer = LiveSceneAuditorWindow.ScanIntervalSeconds;
+                }
+
+                if (LiveSceneAuditorWindow.CurrentScanMode == LiveSceneAuditorWindow.ScanMode.Interval)
+                {
+                    GUILayout.Space(4);
+                    float cd = Mathf.Max(0f, LiveSceneAuditorWindow.BackgroundIntervalTimer);
+                    GUILayout.Label($"{cd:F0}s", EditorStyles.miniLabel);
+                }
+                EditorGUILayout.EndHorizontal();
+
+                EditorGUILayout.Space(2);
+                EditorGUI.BeginChangeCheck();
+                bool syncVal = EditorGUILayout.ToggleLeft(
+                    new GUIContent("🔄 Sync Game Cam", "Aligns Game View Camera to Scene View in real-time as you navigate"), 
+                    LiveSceneAuditorWindow.SyncWithSceneView, 
+                    EditorStyles.miniBoldLabel);
+                if (EditorGUI.EndChangeCheck())
+                {
+                    LiveSceneAuditorWindow.SyncWithSceneView = syncVal;
+                }
+
+                EditorGUILayout.Space(2);
                 if (GUILayout.Button("Open Auditor Window", EditorStyles.miniButton, GUILayout.Height(20)))
                 {
                     LiveSceneAuditorWindow.ShowWindow();
@@ -252,6 +321,74 @@ namespace AceModules.LiveSceneAuditor
             }
 
             EditorGUILayout.EndVertical();
+        }
+
+        private static void OnEditorUpdate()
+        {
+            double now = EditorApplication.timeSinceStartup;
+            if (_lastEditorTime <= 0)
+            {
+                _lastEditorTime = now;
+                return;
+            }
+
+            float dt = (float)(now - _lastEditorTime);
+            _lastEditorTime = now;
+
+            if (dt <= 0f || dt > 1f) dt = 0.033f;
+
+            // Trigger initial scan if needed once scene is loaded
+            if (!_initialScanDone && !EditorApplication.isCompiling && !EditorApplication.isUpdating)
+            {
+                _initialScanDone = true;
+                if (LiveSceneAuditorWindow.CurrentReport == null && !LiveSceneAuditorWindow.IsScanning)
+                {
+                    LiveSceneAuditorWindow.RequestScan(LiveSceneAuditorWindow.AutoScope == LiveSceneAuditorWindow.ScanScope.EntireScene);
+                }
+            }
+
+            if (LiveSceneAuditorWindow.IsScanning) return;
+
+            // Handle Interval mode in background
+            if (LiveSceneAuditorWindow.CurrentScanMode == LiveSceneAuditorWindow.ScanMode.Interval)
+            {
+                LiveSceneAuditorWindow.BackgroundIntervalTimer -= dt;
+                if (LiveSceneAuditorWindow.BackgroundIntervalTimer <= 0f)
+                {
+                    LiveSceneAuditorWindow.BackgroundIntervalTimer = LiveSceneAuditorWindow.ScanIntervalSeconds;
+                    LiveSceneAuditorWindow.RequestScan(LiveSceneAuditorWindow.AutoScope == LiveSceneAuditorWindow.ScanScope.EntireScene);
+                }
+            }
+            // Handle OnChange debounce in background
+            else if (LiveSceneAuditorWindow.CurrentScanMode == LiveSceneAuditorWindow.ScanMode.OnChange)
+            {
+                if (LiveSceneAuditorWindow.BackgroundChangeDebounceTimer > 0f)
+                {
+                    LiveSceneAuditorWindow.BackgroundChangeDebounceTimer -= dt;
+                    if (LiveSceneAuditorWindow.BackgroundChangeDebounceTimer <= 0f)
+                    {
+                        LiveSceneAuditorWindow.BackgroundChangeDebounceTimer = -1f;
+                        LiveSceneAuditorWindow.RequestScan(LiveSceneAuditorWindow.AutoScope == LiveSceneAuditorWindow.ScanScope.EntireScene);
+                    }
+                }
+            }
+        }
+
+        private static void OnHierarchyChanged()
+        {
+            if (LiveSceneAuditorWindow.CurrentScanMode == LiveSceneAuditorWindow.ScanMode.OnChange)
+            {
+                LiveSceneAuditorWindow.BackgroundChangeDebounceTimer = LiveSceneAuditorWindow.ChangeDebounceDuration;
+            }
+        }
+
+        private static UndoPropertyModification[] OnPostprocessModifications(UndoPropertyModification[] modifications)
+        {
+            if (LiveSceneAuditorWindow.CurrentScanMode == LiveSceneAuditorWindow.ScanMode.OnChange)
+            {
+                LiveSceneAuditorWindow.BackgroundChangeDebounceTimer = LiveSceneAuditorWindow.ChangeDebounceDuration;
+            }
+            return modifications;
         }
 
         private static void ApplySnapping(float viewWidth, float viewHeight)
@@ -282,7 +419,8 @@ namespace AceModules.LiveSceneAuditor
 
         private static void DrawMiniBar(string label, float current, float max)
         {
-            float ratio = max > 0 ? (current / max) : 0f;
+            float animCurrent = AuditorUIStyles.GetAnimatedValue("Overlay_" + label, current);
+            float ratio = max > 0 ? (animCurrent / max) : 0f;
             Color barColor = ratio >= 1.0f ? AuditorUIStyles.ColorDanger : (ratio >= 0.75f ? AuditorUIStyles.ColorWarning : AuditorUIStyles.ColorGood);
 
             Rect rowRect = GUILayoutUtility.GetRect(100, 16, GUILayout.ExpandWidth(true));

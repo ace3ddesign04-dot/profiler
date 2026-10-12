@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using UnityEditor;
 using UnityEngine;
 
@@ -102,9 +103,88 @@ namespace AceModules.LiveSceneAuditor
             }
         }
 
+        private class BarAnimState
+        {
+            public float currentValue;
+            public double lastUpdateTime;
+            public bool isAnimating;
+        }
+
+        private static readonly Dictionary<string, BarAnimState> _barAnimStates = new Dictionary<string, BarAnimState>();
+
+        public static bool HasActiveAnimations
+        {
+            get
+            {
+                foreach (var s in _barAnimStates.Values)
+                {
+                    if (s.isAnimating) return true;
+                }
+                return false;
+            }
+        }
+
+        public static float GetAnimatedValue(string key, float targetValue)
+        {
+            double now = EditorApplication.timeSinceStartup;
+
+            if (!_barAnimStates.TryGetValue(key, out var state))
+            {
+                state = new BarAnimState { currentValue = targetValue, lastUpdateTime = now, isAnimating = false };
+                _barAnimStates[key] = state;
+                return targetValue;
+            }
+
+            float snapThreshold = Mathf.Max(0.1f, Mathf.Abs(targetValue) * 0.002f);
+            float diff = targetValue - state.currentValue;
+            if (Mathf.Abs(diff) <= snapThreshold)
+            {
+                state.currentValue = targetValue;
+                state.lastUpdateTime = now;
+                state.isAnimating = false;
+                return targetValue;
+            }
+
+            float dt = (float)(now - state.lastUpdateTime);
+            if (dt > 0.0001f)
+            {
+                dt = Mathf.Min(dt, 0.05f); // Prevent jump after long pauses
+                state.lastUpdateTime = now;
+
+                // Smooth exponential decay lerp: ~95% in 0.3s
+                float t = 1f - Mathf.Exp(-9.0f * dt);
+                state.currentValue = Mathf.Lerp(state.currentValue, targetValue, t);
+
+                if (Mathf.Abs(targetValue - state.currentValue) <= snapThreshold)
+                {
+                    state.currentValue = targetValue;
+                }
+            }
+
+            state.isAnimating = Mathf.Abs(targetValue - state.currentValue) > snapThreshold;
+            if (state.isAnimating)
+            {
+                RequestAnimationRepaint();
+            }
+
+            return state.currentValue;
+        }
+
+        public static void RequestAnimationRepaint()
+        {
+            var window = LiveSceneAuditorWindow.GetActiveWindow();
+            if (window != null)
+            {
+                window.Repaint();
+            }
+            SceneView.RepaintAll();
+        }
+
         public static void DrawBudgetProgressBar(string label, float current, float max, string unit = "")
         {
-            float ratio = max > 0 ? (current / max) : 0f;
+            float animCurrent = GetAnimatedValue("Win_" + label, current);
+            float ratio = max > 0 ? (animCurrent / max) : 0f;
+
             string percentText;
             if (ratio <= 0f) percentText = "0%";
             else if (ratio < 0.10f) percentText = $"{(ratio * 100f):F1}%";
@@ -122,10 +202,10 @@ namespace AceModules.LiveSceneAuditor
             EditorGUILayout.BeginHorizontal();
             EditorGUILayout.LabelField(label, EditorStyles.boldLabel, GUILayout.Width(160));
             
-            string valueText = $"{current:N0} / {max:N0} {unit} ({percentText})";
-            if (current is float && current % 1 != 0)
+            string valueText = $"{animCurrent:N0} / {max:N0} {unit} ({percentText})";
+            if (current % 1 != 0 || animCurrent % 1 != 0)
             {
-                valueText = $"{current:F1} / {max:F1} {unit} ({percentText})";
+                valueText = $"{animCurrent:F1} / {max:F1} {unit} ({percentText})";
             }
 
             GUIStyle coloredValueStyle = new GUIStyle(MetricValue);

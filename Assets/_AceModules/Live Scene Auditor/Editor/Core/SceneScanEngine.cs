@@ -22,14 +22,17 @@ namespace AceModules.LiveSceneAuditor
             public int vertexCount;
             public bool isPartOfLOD;
             public bool isActiveLOD;
-            public bool isBatchingStatic;
-            public bool castsShadows;
-            public int lightmapIndex;
             public int materialCount;
             public List<int> materialInstanceIds;
             public List<string> materialNames;
-            public List<string> shaderNames;
-            public List<bool> materialInstancingEnabled;
+            public List<int> textureInstanceIds;
+            public List<string> textureNames;
+            public bool isModelAsset;
+            public string fbxAssetPath;
+            public string fbxName;
+            public int modelInstanceRootId;
+            public int fbxSceneOccurrences;
+            public List<int> fbxSceneRootIds;
         }
 
         private struct TextureSnapshot
@@ -42,15 +45,38 @@ namespace AceModules.LiveSceneAuditor
             public List<string> usedInMaterials;
         }
 
+        private struct MaterialSnapshot
+        {
+            public int materialInstanceId;
+            public string materialName;
+            public string shaderName;
+            public int textureInstanceId;
+            public string textureName;
+            public int textureWidth;
+            public int textureHeight;
+            public float textureScore;
+            public List<int> rendererInstanceIds;
+            public List<string> rendererNames;
+            public List<int> visibleRendererInstanceIds;
+            public List<string> visibleRendererNames;
+        }
+
         private struct LightSnapshot
         {
-            public Vector3 position;
+            public int instanceId;
+            public string name;
             public LightType type;
+            public LightShadows shadows;
+            public bool isRealtime;
+            public bool isBaked;
+            public bool isMixed;
+            public bool isActiveAndEnabled;
+            public bool isVisibleInView;
             public float range;
-            public float spotAngle;
-            public Vector3 forward;
             public float intensity;
-            public LightShadows shadowType;
+            public Color color;
+            public Vector3 position;
+            public float spotAngle;
             public LightRenderMode renderMode;
         }
 
@@ -62,57 +88,26 @@ namespace AceModules.LiveSceneAuditor
             public float fov;
             public bool isGameCamera;
             public bool isPlaying;
-            public int shadowCascades;
-            public bool hasDirectionalShadows;
-            public float shadowDistance;
-            public int activeCanvasDrawCalls;
-            public List<LightSnapshot> pixelLights;
             public int unityStatsTriangles;
             public int unityStatsVertices;
-            public int unityStatsBatches;
-            public int exactPlayModeBatches;
             public bool isValid;
         }
 
-        public struct StaticBatchEquivalenceKey : IEquatable<StaticBatchEquivalenceKey>
+        private struct ViewpointSnapshot
         {
-            public readonly int MaterialInstanceId;
-            public readonly int LightmapIndex;
-
-            public StaticBatchEquivalenceKey(int materialInstanceId, int lightmapIndex)
-            {
-                MaterialInstanceId = materialInstanceId;
-                LightmapIndex = lightmapIndex;
-            }
-
-            public bool Equals(StaticBatchEquivalenceKey other)
-            {
-                return MaterialInstanceId == other.MaterialInstanceId &&
-                       LightmapIndex == other.LightmapIndex;
-            }
-
-            public override bool Equals(object obj)
-            {
-                return obj is StaticBatchEquivalenceKey other && Equals(other);
-            }
-
-            public override int GetHashCode()
-            {
-                unchecked
-                {
-                    return (MaterialInstanceId * 397) ^ LightmapIndex;
-                }
-            }
+            public string name;
+            public int instanceId;
+            public Vector3 position;
+            public Vector3 rotationEuler;
+            public Plane[] frustumPlanes;
+            public float fov;
         }
 
         private static CancellationTokenSource _activeCts;
         private static SynchronizationContext _mainThreadContext;
 
-        private static int _cleanGameViewBatches = 0;
-        private static int _lastGameCameraBatches = 0;
         private static int _lastGameCameraTris = 0;
         private static int _lastGameCameraVerts = 0;
-        private static bool _hasCleanCapture = false;
 
         [InitializeOnLoadMethod]
         private static void Init()
@@ -125,20 +120,12 @@ namespace AceModules.LiveSceneAuditor
         private static void OnGlobalPostRender(Camera cam)
         {
             if (cam == null || cam.targetTexture != null) return;
-            // Capture when Game Camera renders naturally to screen / GameView (not to offscreen temporary RT)
+            // Capture when Game Camera renders naturally to screen / GameView
             if (cam == Camera.main || cam.CompareTag("MainCamera") || cam.cameraType == CameraType.Game)
             {
-                _cleanGameViewBatches = UnityEditor.UnityStats.batches;
-                _lastGameCameraBatches = _cleanGameViewBatches;
                 _lastGameCameraTris = UnityEditor.UnityStats.triangles;
                 _lastGameCameraVerts = UnityEditor.UnityStats.vertices;
-                _hasCleanCapture = true;
             }
-        }
-
-        public static int GetCleanEditModeBatches()
-        {
-            return _cleanGameViewBatches;
         }
 
         public static void RequestGameViewRepaint()
@@ -158,62 +145,60 @@ namespace AceModules.LiveSceneAuditor
             catch {}
         }
 
-        private static int CalculateStaticBatchSavings(List<RendererSnapshot> visibleRenderers)
+        private static List<ViewpointSnapshot> CaptureViewpointSnapshots(List<Transform> viewpoints, Camera refCam)
         {
-            Dictionary<StaticBatchEquivalenceKey, int> groupSubmeshCounts = new Dictionary<StaticBatchEquivalenceKey, int>();
-            Dictionary<StaticBatchEquivalenceKey, int> groupVertexCounts = new Dictionary<StaticBatchEquivalenceKey, int>();
+            List<ViewpointSnapshot> list = new List<ViewpointSnapshot>();
+            if (viewpoints == null || viewpoints.Count == 0) return list;
 
-            for (int i = 0; i < visibleRenderers.Count; i++)
+            GameObject tempCamGo = null;
+            Camera tempCam = null;
+
+            try
             {
-                RendererSnapshot r = visibleRenderers[i];
-
-                if (!r.isBatchingStatic || r.materialInstanceIds == null || r.materialInstanceIds.Count == 0)
-                    continue;
-
-                // Skip probe-lit objects (lightmapIndex == -1); they break batching via SH constants in Built-in Forward
-                if (r.lightmapIndex < 0)
-                    continue;
-
-                for (int m = 0; m < r.materialInstanceIds.Count; m++)
+                tempCamGo = new GameObject("__Auditor_TempViewpointCam") { hideFlags = HideFlags.HideAndDontSave };
+                tempCam = tempCamGo.AddComponent<Camera>();
+                if (refCam != null)
                 {
-                    int matId = r.materialInstanceIds[m];
-                    var key = new StaticBatchEquivalenceKey(matId, r.lightmapIndex);
+                    tempCam.CopyFrom(refCam);
+                }
+                else
+                {
+                    tempCam.fieldOfView = 60f;
+                    tempCam.nearClipPlane = 0.3f;
+                    tempCam.farClipPlane = 1000f;
+                }
 
-                    if (!groupSubmeshCounts.ContainsKey(key))
+                foreach (var vp in viewpoints)
+                {
+                    if (vp == null) continue;
+                    tempCam.transform.position = vp.position;
+                    tempCam.transform.rotation = vp.rotation;
+
+                    Plane[] planes = GeometryUtility.CalculateFrustumPlanes(tempCam);
+                    list.Add(new ViewpointSnapshot
                     {
-                        groupSubmeshCounts[key] = 0;
-                        groupVertexCounts[key] = 0;
-                    }
-
-                    groupSubmeshCounts[key]++;
-                    groupVertexCounts[key] += r.vertexCount;
+                        name = vp.name,
+                        instanceId = vp.gameObject.GetInstanceID(),
+                        position = vp.position,
+                        rotationEuler = vp.rotation.eulerAngles,
+                        frustumPlanes = planes,
+                        fov = tempCam.fieldOfView
+                    });
                 }
             }
-
-            int totalSavings = 0;
-            const int maxVerticesPerStaticBatch = 65536;
-
-            foreach (var kvp in groupSubmeshCounts)
+            catch (Exception ex)
             {
-                StaticBatchEquivalenceKey key = kvp.Key;
-                int submeshCount = kvp.Value;
-                int totalVertices = groupVertexCounts[key];
-
-                // Determine combined batches required in Play Mode
-                int batchedDrawCalls = Mathf.CeilToInt((float)totalVertices / maxVerticesPerStaticBatch);
-                batchedDrawCalls = Mathf.Max(1, batchedDrawCalls);
-
-                // Savings represent uncombined Edit-Mode draws eliminated at runtime
-                int savings = submeshCount - batchedDrawCalls;
-                if (savings > 0)
+                Debug.LogWarning($"[Live Scene Auditor] Failed to capture viewpoint frustums: {ex.Message}");
+            }
+            finally
+            {
+                if (tempCamGo != null)
                 {
-                    totalSavings += savings;
+                    UnityEngine.Object.DestroyImmediate(tempCamGo);
                 }
             }
 
-            Debug.Log($"[CalculateStaticBatchSavings] visibleCount={visibleRenderers.Count}, groups={groupSubmeshCounts.Count}, totalSavings={totalSavings}");
-
-            return totalSavings;
+            return list;
         }
 
         /// <summary>
@@ -226,7 +211,8 @@ namespace AceModules.LiveSceneAuditor
             bool includeInactive,
             Camera targetCamera,
             bool isGameCamera,
-            Action<SceneAuditReport> onCompleted)
+            Action<SceneAuditReport> onCompleted,
+            List<Transform> viewpoints = null)
         {
             if (_mainThreadContext == null)
             {
@@ -254,13 +240,16 @@ namespace AceModules.LiveSceneAuditor
                 targetCamera = Camera.main != null ? Camera.main : (SceneView.lastActiveSceneView != null ? SceneView.lastActiveSceneView.camera : null);
             }
             CameraSnapshot camSnap = CaptureCameraSnapshot(targetCamera, isGameCamera);
-            List<RendererSnapshot> renderers = CaptureRenderersSnapshot(includeInactive, camSnap);
+            List<RendererSnapshot> renderers = CaptureRenderersSnapshot(includeInactive, camSnap, out int fbxCount);
             List<TextureSnapshot> textures = CaptureTexturesSnapshot();
+            List<MaterialSnapshot> materials = CaptureMaterialsSnapshot(includeInactive, camSnap);
+            List<LightSnapshot> lights = CaptureLightsSnapshot(includeInactive, camSnap);
+            List<ViewpointSnapshot> viewpointSnaps = CaptureViewpointSnapshots(viewpoints, targetCamera);
 
             if (!asyncMode)
             {
                 // Synchronous immediate processing
-                SceneAuditReport report = ProcessSnapshot(renderers, textures, camSnap, frustumOnly, profile);
+                SceneAuditReport report = ProcessSnapshot(renderers, textures, materials, lights, camSnap, frustumOnly, profile, fbxCount, viewpointSnaps);
                 sw.Stop();
                 report.scanDurationMs = (float)sw.Elapsed.TotalMilliseconds;
                 onCompleted?.Invoke(report);
@@ -278,7 +267,7 @@ namespace AceModules.LiveSceneAuditor
                     {
                         if (token.IsCancellationRequested) return;
 
-                        SceneAuditReport report = ProcessSnapshot(renderers, textures, camSnap, frustumOnly, profile);
+                        SceneAuditReport report = ProcessSnapshot(renderers, textures, materials, lights, camSnap, frustumOnly, profile, fbxCount, viewpointSnaps);
                         sw.Stop();
                         report.scanDurationMs = (float)sw.Elapsed.TotalMilliseconds;
 
@@ -322,90 +311,6 @@ namespace AceModules.LiveSceneAuditor
         {
             CameraSnapshot snap = new CameraSnapshot();
             snap.isPlaying = EditorApplication.isPlaying;
-            snap.shadowCascades = Mathf.Max(1, QualitySettings.shadowCascades);
-            snap.shadowDistance = QualitySettings.shadowDistance > 0 ? QualitySettings.shadowDistance : 40f;
-            snap.hasDirectionalShadows = false;
-            snap.activeCanvasDrawCalls = 0;
-            snap.pixelLights = new List<LightSnapshot>();
-            try
-            {
-                Light[] sceneLights = GameObject.FindObjectsOfType<Light>();
-                Light mainDir = null;
-                float maxDirIntensity = -1f;
-
-                foreach (var l in sceneLights)
-                {
-                    if (l != null && l.enabled && l.gameObject.activeInHierarchy && l.type == LightType.Directional)
-                    {
-                        if (l.intensity > maxDirIntensity)
-                        {
-                            maxDirIntensity = l.intensity;
-                            mainDir = l;
-                        }
-                    }
-                }
-
-                if (mainDir != null && mainDir.shadows != LightShadows.None)
-                {
-                    snap.hasDirectionalShadows = true;
-                }
-
-                // Gather additional pixel lights up to QualitySettings.pixelLightCount (render in ForwardAdd passes)
-                int maxPixelLights = QualitySettings.pixelLightCount;
-                if (maxPixelLights > 0)
-                {
-                    List<Light> candidates = new List<Light>();
-                    foreach (var l in sceneLights)
-                    {
-                        if (l == null || !l.enabled || !l.gameObject.activeInHierarchy) continue;
-                        if (l == mainDir) continue;
-                        if (l.renderMode == LightRenderMode.ForceVertex) continue;
-
-                        candidates.Add(l);
-                    }
-
-                    candidates.Sort((a, b) =>
-                    {
-                        if (a.renderMode == LightRenderMode.ForcePixel && b.renderMode != LightRenderMode.ForcePixel) return -1;
-                        if (b.renderMode == LightRenderMode.ForcePixel && a.renderMode != LightRenderMode.ForcePixel) return 1;
-                        return b.intensity.CompareTo(a.intensity);
-                    });
-
-                    int takeCount = Mathf.Min(maxPixelLights, candidates.Count);
-                    for (int i = 0; i < takeCount; i++)
-                    {
-                        var l = candidates[i];
-                        snap.pixelLights.Add(new LightSnapshot
-                        {
-                            position = l.transform.position,
-                            type = l.type,
-                            range = l.range > 0 ? l.range : 10f,
-                            spotAngle = l.spotAngle,
-                            forward = l.transform.forward,
-                            intensity = l.intensity,
-                            shadowType = l.shadows,
-                            renderMode = l.renderMode
-                        });
-                    }
-                }
-
-                Canvas[] canvases = GameObject.FindObjectsOfType<Canvas>();
-                foreach (var c in canvases)
-                {
-                    if (c != null && c.enabled && c.gameObject.activeInHierarchy)
-                    {
-                        if (c.renderMode == RenderMode.ScreenSpaceOverlay || c.worldCamera == cam || c.worldCamera == null)
-                        {
-                            int crCount = c.GetComponentsInChildren<CanvasRenderer>(false).Length;
-                            if (crCount > 0)
-                            {
-                                snap.activeCanvasDrawCalls += Mathf.Clamp(Mathf.CeilToInt(crCount / 8f), 1, 4);
-                            }
-                        }
-                    }
-                }
-            }
-            catch {}
 
             if (cam != null)
             {
@@ -414,37 +319,8 @@ namespace AceModules.LiveSceneAuditor
                 snap.frustumPlanes = GeometryUtility.CalculateFrustumPlanes(cam);
                 snap.fov = cam.fieldOfView > 0 ? cam.fieldOfView : 60f;
                 snap.isGameCamera = isGameCamera || (cam == Camera.main || cam.CompareTag("MainCamera") || cam.cameraType == CameraType.Game);
-
-                if (snap.isGameCamera && !snap.isPlaying)
-                {
-                    if (_cleanGameViewBatches > 0)
-                    {
-                        snap.unityStatsBatches = _cleanGameViewBatches;
-                        snap.unityStatsTriangles = _lastGameCameraTris > 0 ? _lastGameCameraTris : UnityEditor.UnityStats.triangles;
-                        snap.unityStatsVertices = _lastGameCameraVerts > 0 ? _lastGameCameraVerts : UnityEditor.UnityStats.vertices;
-                    }
-                    else if (_lastGameCameraBatches > 0)
-                    {
-                        snap.unityStatsBatches = _lastGameCameraBatches;
-                        snap.unityStatsTriangles = _lastGameCameraTris > 0 ? _lastGameCameraTris : UnityEditor.UnityStats.triangles;
-                        snap.unityStatsVertices = _lastGameCameraVerts > 0 ? _lastGameCameraVerts : UnityEditor.UnityStats.vertices;
-                    }
-                    else
-                    {
-                        // Fallback if GameView has not rendered yet: Offscreen GPU Camera Render pass
-                        int gpuBatches = RenderCameraAndCaptureGpuBatches(cam, out int gpuTris, out int gpuVerts);
-                        snap.unityStatsTriangles = gpuTris > 0 ? gpuTris : UnityEditor.UnityStats.triangles;
-                        snap.unityStatsVertices = gpuVerts > 0 ? gpuVerts : UnityEditor.UnityStats.vertices;
-                        snap.unityStatsBatches = gpuBatches > 0 ? gpuBatches : UnityEditor.UnityStats.batches;
-                    }
-                }
-                else
-                {
-                    snap.unityStatsTriangles = (_lastGameCameraTris > 0 && snap.isGameCamera) ? _lastGameCameraTris : UnityEditor.UnityStats.triangles;
-                    snap.unityStatsVertices = (_lastGameCameraVerts > 0 && snap.isGameCamera) ? _lastGameCameraVerts : UnityEditor.UnityStats.vertices;
-                    snap.unityStatsBatches = (_cleanGameViewBatches > 0 && snap.isGameCamera) ? _cleanGameViewBatches : UnityEditor.UnityStats.batches;
-                }
-                snap.exactPlayModeBatches = PlayModeBatchCaptureManager.GetExactBatchesIfMatching(cam);
+                snap.unityStatsTriangles = _lastGameCameraTris > 0 ? _lastGameCameraTris : UnityEditor.UnityStats.triangles;
+                snap.unityStatsVertices = _lastGameCameraVerts > 0 ? _lastGameCameraVerts : UnityEditor.UnityStats.vertices;
                 snap.isValid = true;
             }
             else
@@ -453,76 +329,16 @@ namespace AceModules.LiveSceneAuditor
                 snap.isGameCamera = isGameCamera;
                 snap.unityStatsTriangles = UnityEditor.UnityStats.triangles;
                 snap.unityStatsVertices = UnityEditor.UnityStats.vertices;
-                snap.unityStatsBatches = UnityEditor.UnityStats.batches;
-                snap.exactPlayModeBatches = PlayModeBatchCaptureManager.LastExactBatches;
                 snap.fov = 60f;
                 snap.frustumPlanes = new Plane[0];
             }
             return snap;
         }
 
-        private static int RenderCameraAndCaptureGpuBatches(Camera cam, out int outTris, out int outVerts)
-        {
-            outTris = 0;
-            outVerts = 0;
-            if (cam == null) return 0;
-
-            int postRenderBatches = 0;
-            int postRenderTris = 0;
-            int postRenderVerts = 0;
-
-            Camera.CameraCallback onPost = (c) =>
-            {
-                if (c == cam)
-                {
-                    postRenderBatches = UnityEditor.UnityStats.batches;
-                    postRenderTris = UnityEditor.UnityStats.triangles;
-                    postRenderVerts = UnityEditor.UnityStats.vertices;
-                }
-            };
-
-            int statsBefore = UnityEditor.UnityStats.batches;
-            RenderTexture prevTarget = cam.targetTexture;
-            RenderTexture prevActive = RenderTexture.active;
-
-            int width = Mathf.Clamp(cam.pixelWidth > 0 ? cam.pixelWidth : 1280, 16, 4096);
-            int height = Mathf.Clamp(cam.pixelHeight > 0 ? cam.pixelHeight : 720, 16, 4096);
-            RenderTexture tempRT = RenderTexture.GetTemporary(width, height, 24, RenderTextureFormat.Default);
-
-            try
-            {
-                Camera.onPostRender += onPost;
-                cam.targetTexture = tempRT;
-                RenderTexture.active = tempRT;
-
-                // Warm up 3 frames so static batching buffers & shadow cascades settle into steady-state
-                for (int i = 0; i < 3; i++)
-                {
-                    cam.Render();
-                }
-            }
-            catch (Exception ex)
-            {
-                Debug.LogWarning($"[Live Scene Auditor] GPU Camera Render error: {ex.Message}");
-            }
-            finally
-            {
-                Camera.onPostRender -= onPost;
-                cam.targetTexture = prevTarget;
-                RenderTexture.active = prevActive;
-                RenderTexture.ReleaseTemporary(tempRT);
-            }
-
-            int statsAfter = UnityEditor.UnityStats.batches;
-            outTris = postRenderTris > 0 ? postRenderTris : UnityEditor.UnityStats.triangles;
-            outVerts = postRenderVerts > 0 ? postRenderVerts : UnityEditor.UnityStats.vertices;
-
-            return postRenderBatches > 0 ? postRenderBatches : statsAfter;
-        }
-
-        private static List<RendererSnapshot> CaptureRenderersSnapshot(bool includeInactive, CameraSnapshot camSnap)
+        private static List<RendererSnapshot> CaptureRenderersSnapshot(bool includeInactive, CameraSnapshot camSnap, out int fbxCount)
         {
             List<RendererSnapshot> list = new List<RendererSnapshot>();
+            HashSet<string> uniqueFbxPaths = new HashSet<string>();
 
             // Identify LOD groups first with strict active and inactive sets
             LODGroup[] lodGroups = GameObject.FindObjectsOfType<LODGroup>(includeInactive);
@@ -576,7 +392,45 @@ namespace AceModules.LiveSceneAuditor
                 }
             }
 
-            // Collect all MeshRenderers & SkinnedMeshRenderers
+            // Pass 1: Build scene-wide FBX model occurrence mapping across ALL scene objects
+            Renderer[] allSceneRenderers = GameObject.FindObjectsOfType<Renderer>(true);
+            Dictionary<string, HashSet<int>> fbxToAllSceneRootIds = new Dictionary<string, HashSet<int>>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var r in allSceneRenderers)
+            {
+                if (r == null || IsIgnoredRenderer(r)) continue;
+
+                Mesh m = null;
+                if (r is MeshRenderer)
+                {
+                    MeshFilter mf = r.GetComponent<MeshFilter>();
+                    if (mf != null) m = mf.sharedMesh;
+                }
+                else if (r is SkinnedMeshRenderer smr)
+                {
+                    m = smr.sharedMesh;
+                }
+
+                if (m == null) continue;
+
+                string path = AssetDatabase.GetAssetPath(m);
+                if (!string.IsNullOrEmpty(path) && IsModelAssetPath(path))
+                {
+                    uniqueFbxPaths.Add(path);
+
+                    if (!fbxToAllSceneRootIds.TryGetValue(path, out var rootSet))
+                    {
+                        rootSet = new HashSet<int>();
+                        fbxToAllSceneRootIds[path] = rootSet;
+                    }
+
+                    GameObject rootGo = PrefabUtility.GetNearestPrefabInstanceRoot(r.gameObject);
+                    if (rootGo == null) rootGo = r.gameObject;
+                    rootSet.Add(rootGo.GetInstanceID());
+                }
+            }
+
+            // Collect all MeshRenderers & SkinnedMeshRenderers according to includeInactive
             Renderer[] allRenderers = GameObject.FindObjectsOfType<Renderer>(includeInactive);
 
             foreach (var r in allRenderers)
@@ -587,13 +441,6 @@ namespace AceModules.LiveSceneAuditor
                 // Ignore TextMeshPro and Canvas/UI components
                 if (IsIgnoredRenderer(r))
                     continue;
-
-                // Strict LOD rule: If part of an LOD group and NOT in the active set, SKIP ENTIRELY!
-                bool isPartOfLod = activeLodRenderers.Contains(r) || inactiveLodRenderers.Contains(r);
-                if (inactiveLodRenderers.Contains(r) && !activeLodRenderers.Contains(r))
-                {
-                    continue; // Skip inactive LOD meshes
-                }
 
                 Mesh mesh = null;
                 if (r is MeshRenderer)
@@ -607,6 +454,28 @@ namespace AceModules.LiveSceneAuditor
                 }
 
                 if (mesh == null) continue;
+
+                string assetPath = AssetDatabase.GetAssetPath(mesh);
+                bool isModel = !string.IsNullOrEmpty(assetPath) && IsModelAssetPath(assetPath);
+                string fbxName = isModel ? System.IO.Path.GetFileNameWithoutExtension(assetPath) : "";
+                int occurrences = 0;
+                List<int> rootIds = null;
+                GameObject rootInstanceGo = PrefabUtility.GetNearestPrefabInstanceRoot(r.gameObject);
+                if (rootInstanceGo == null) rootInstanceGo = r.gameObject;
+                int rootInstanceId = rootInstanceGo.GetInstanceID();
+
+                if (isModel && fbxToAllSceneRootIds.TryGetValue(assetPath, out var rRoots))
+                {
+                    occurrences = rRoots.Count;
+                    rootIds = rRoots.ToList();
+                }
+
+                // Strict LOD rule: If part of an LOD group and NOT in the active set, SKIP ENTIRELY!
+                bool isPartOfLod = activeLodRenderers.Contains(r) || inactiveLodRenderers.Contains(r);
+                if (inactiveLodRenderers.Contains(r) && !activeLodRenderers.Contains(r))
+                {
+                    continue; // Skip inactive LOD meshes
+                }
 
                 int triCount = 0;
                 try
@@ -622,14 +491,12 @@ namespace AceModules.LiveSceneAuditor
                     triCount = 0;
                 }
 
-                bool isBatchingStatic = GameObjectUtility.AreStaticEditorFlagsSet(r.gameObject, StaticEditorFlags.BatchingStatic);
-                bool castsShadows = (r.shadowCastingMode != UnityEngine.Rendering.ShadowCastingMode.Off);
-
                 Material[] sharedMats = r.sharedMaterials;
                 List<int> matIds = new List<int>();
                 List<string> matNames = new List<string>();
-                List<string> shaderNames = new List<string>();
-                List<bool> matInstancing = new List<bool>();
+                List<int> texIds = new List<int>();
+                List<string> texNames = new List<string>();
+                HashSet<int> seenTex = new HashSet<int>();
 
                 if (sharedMats != null)
                 {
@@ -639,8 +506,25 @@ namespace AceModules.LiveSceneAuditor
                         {
                             matIds.Add(m.GetInstanceID());
                             matNames.Add(m.name);
-                            if (m.shader != null) shaderNames.Add(m.shader.name);
-                            matInstancing.Add(m.enableInstancing);
+
+                            try
+                            {
+                                string[] propNames = m.GetTexturePropertyNames();
+                                if (propNames != null)
+                                {
+                                    foreach (var prop in propNames)
+                                    {
+                                        Texture tex = m.GetTexture(prop);
+                                        if (tex != null && !IsIgnoredAsset(tex) && !seenTex.Contains(tex.GetInstanceID()))
+                                        {
+                                            seenTex.Add(tex.GetInstanceID());
+                                            texIds.Add(tex.GetInstanceID());
+                                            texNames.Add(tex.name);
+                                        }
+                                    }
+                                }
+                            }
+                            catch {}
                         }
                     }
                 }
@@ -654,17 +538,21 @@ namespace AceModules.LiveSceneAuditor
                     vertexCount = mesh.vertexCount,
                     isPartOfLOD = isPartOfLod,
                     isActiveLOD = true,
-                    isBatchingStatic = isBatchingStatic,
-                    castsShadows = castsShadows,
-                    lightmapIndex = r.lightmapIndex,
                     materialCount = matIds.Count,
                     materialInstanceIds = matIds,
                     materialNames = matNames,
-                    shaderNames = shaderNames,
-                    materialInstancingEnabled = matInstancing
+                    textureInstanceIds = texIds,
+                    textureNames = texNames,
+                    isModelAsset = isModel,
+                    fbxAssetPath = isModel ? assetPath : "",
+                    fbxName = fbxName,
+                    modelInstanceRootId = rootInstanceId,
+                    fbxSceneOccurrences = occurrences,
+                    fbxSceneRootIds = rootIds ?? new List<int>()
                 });
             }
 
+            fbxCount = uniqueFbxPaths.Count;
             return list;
         }
 
@@ -720,6 +608,267 @@ namespace AceModules.LiveSceneAuditor
             return list;
         }
 
+        private static List<MaterialSnapshot> CaptureMaterialsSnapshot(bool includeInactive, CameraSnapshot camSnap)
+        {
+            List<MaterialSnapshot> list = new List<MaterialSnapshot>();
+            Dictionary<int, MaterialSnapshot> matMap = new Dictionary<int, MaterialSnapshot>();
+
+            Renderer[] allRenderers = GameObject.FindObjectsOfType<Renderer>(includeInactive);
+            foreach (var r in allRenderers)
+            {
+                if (r == null || !r.enabled || (!r.gameObject.activeInHierarchy && !includeInactive))
+                    continue;
+
+                if (IsIgnoredRenderer(r))
+                    continue;
+
+                Material[] sharedMats = r.sharedMaterials;
+                if (sharedMats == null) continue;
+
+                bool isVisibleInView = camSnap.isValid && TestPlanesAABBThreadSafe(camSnap.frustumPlanes, r.bounds);
+
+                foreach (var m in sharedMats)
+                {
+                    if (m == null || IsIgnoredAsset(m)) continue;
+
+                    int mId = m.GetInstanceID();
+                    if (!matMap.TryGetValue(mId, out MaterialSnapshot snap))
+                    {
+                        snap = new MaterialSnapshot
+                        {
+                            materialInstanceId = mId,
+                            materialName = m.name,
+                            shaderName = m.shader != null ? m.shader.name : "Standard",
+                            rendererInstanceIds = new List<int>(),
+                            rendererNames = new List<string>(),
+                            visibleRendererInstanceIds = new List<int>(),
+                            visibleRendererNames = new List<string>()
+                        };
+
+                        Texture mainTex = null;
+                        try
+                        {
+                            mainTex = m.mainTexture;
+                        }
+                        catch {}
+
+                        if (mainTex == null)
+                        {
+                            try
+                            {
+                                if (m.HasProperty("_BaseMap")) mainTex = m.GetTexture("_BaseMap");
+                                else if (m.HasProperty("_MainTex")) mainTex = m.GetTexture("_MainTex");
+                            }
+                            catch {}
+                        }
+
+                        if (mainTex != null && !IsIgnoredAsset(mainTex))
+                        {
+                            snap.textureInstanceId = mainTex.GetInstanceID();
+                            snap.textureName = mainTex.name;
+                            snap.textureWidth = mainTex.width;
+                            snap.textureHeight = mainTex.height;
+                            snap.textureScore = ((float)mainTex.width / 512f) * ((float)mainTex.height / 512f);
+                        }
+                        else
+                        {
+                            snap.textureInstanceId = 0;
+                            snap.textureName = "(No Texture / Flat Color)";
+                            snap.textureWidth = 0;
+                            snap.textureHeight = 0;
+                            snap.textureScore = 0f;
+                        }
+
+                        matMap[mId] = snap;
+                    }
+
+                    int rId = r.gameObject.GetInstanceID();
+                    if (!snap.rendererInstanceIds.Contains(rId))
+                    {
+                        snap.rendererInstanceIds.Add(rId);
+                        snap.rendererNames.Add(r.gameObject.name);
+                    }
+
+                    if (isVisibleInView && !snap.visibleRendererInstanceIds.Contains(rId))
+                    {
+                        snap.visibleRendererInstanceIds.Add(rId);
+                        snap.visibleRendererNames.Add(r.gameObject.name);
+                    }
+                }
+            }
+
+            list.AddRange(matMap.Values);
+            return list;
+        }
+
+        private static List<LightSnapshot> CaptureLightsSnapshot(bool includeInactive, CameraSnapshot camSnap)
+        {
+            List<LightSnapshot> list = new List<LightSnapshot>();
+            Light[] allLights = GameObject.FindObjectsOfType<Light>(includeInactive);
+
+            foreach (var light in allLights)
+            {
+                if (light == null) continue;
+                if ((light.gameObject.hideFlags & (HideFlags.DontSave | HideFlags.HideAndDontSave)) != 0) continue;
+                if (!light.gameObject.scene.IsValid() || !light.gameObject.scene.isLoaded) continue;
+
+                bool isActive = light.isActiveAndEnabled;
+                if (!includeInactive && !isActive)
+                {
+                    continue;
+                }
+
+                var bakeType = light.bakingOutput.lightmapBakeType;
+                bool isRealtime = (bakeType == LightmapBakeType.Realtime);
+                bool isBaked = (bakeType == LightmapBakeType.Baked);
+                bool isMixed = (bakeType == LightmapBakeType.Mixed);
+
+                bool isVisible = false;
+                if (isActive)
+                {
+                    if (light.type == LightType.Directional)
+                    {
+                        // Directional lights have infinite reach across the camera frustum
+                        isVisible = true;
+                    }
+                    else if (camSnap.isValid)
+                    {
+                        // Test sphere vs camera frustum planes
+                        isVisible = TestSphereFrustum(light.transform.position, Mathf.Max(0.1f, light.range), camSnap.frustumPlanes);
+                    }
+                    else
+                    {
+                        isVisible = true;
+                    }
+                }
+
+                list.Add(new LightSnapshot
+                {
+                    instanceId = light.gameObject.GetInstanceID(),
+                    name = light.gameObject.name,
+                    type = light.type,
+                    shadows = light.shadows,
+                    isRealtime = isRealtime,
+                    isBaked = isBaked,
+                    isMixed = isMixed,
+                    isActiveAndEnabled = isActive,
+                    isVisibleInView = isVisible,
+                    range = light.range,
+                    intensity = light.intensity,
+                    color = light.color,
+                    position = light.transform.position,
+                    spotAngle = (light.type == LightType.Spot) ? light.spotAngle : 0f,
+                    renderMode = light.renderMode
+                });
+            }
+
+            return list;
+        }
+
+        public static bool TestSphereFrustum(Vector3 center, float radius, Plane[] planes)
+        {
+            if (planes == null || planes.Length == 0) return true;
+            for (int i = 0; i < planes.Length; i++)
+            {
+                if (planes[i].GetDistanceToPoint(center) < -radius)
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        private static List<AtlasGroupSuggestion> GenerateAtlasSuggestions(List<MaterialSnapshot> materials)
+        {
+            List<AtlasGroupSuggestion> list = new List<AtlasGroupSuggestion>();
+            if (materials == null || materials.Count == 0) return list;
+
+            var groups = materials
+                .GroupBy(m => m.shaderName)
+                .Where(g => g.Count() >= 2)
+                .OrderByDescending(g => g.Count());
+
+            foreach (var group in groups)
+            {
+                string fullShader = group.Key;
+                string simpleShader = GetSimpleShaderName(fullShader);
+                var matList = group.OrderBy(m => m.rendererInstanceIds.Count).ToList();
+
+                AtlasGroupSuggestion suggestion = new AtlasGroupSuggestion
+                {
+                    shaderName = fullShader,
+                    groupTitle = $"{simpleShader} ({matList.Count} Materials)",
+                    potentialMaterialSavings = matList.Count - 1,
+                    isFoldedOut = true
+                };
+
+                float combinedScore = 0f;
+                long totalArea = 0;
+                int totalRenderers = 0;
+
+                foreach (var mat in matList)
+                {
+                    combinedScore += mat.textureScore;
+                    totalRenderers += mat.rendererInstanceIds.Count;
+
+                    int w = mat.textureWidth > 0 ? mat.textureWidth : 256;
+                    int h = mat.textureHeight > 0 ? mat.textureHeight : 256;
+                    totalArea += (long)(w * h);
+
+                    suggestion.candidates.Add(new AtlasCandidateItem
+                    {
+                        materialName = mat.materialName,
+                        materialInstanceId = mat.materialInstanceId,
+                        instanceId = mat.materialInstanceId,
+                        rendererName = mat.rendererNames.Count > 0 ? mat.rendererNames[0] : "None",
+                        textureName = mat.textureName,
+                        textureInstanceId = mat.textureInstanceId,
+                        width = mat.textureWidth,
+                        height = mat.textureHeight,
+                        textureScore = mat.textureScore,
+                        rendererUsageCount = mat.rendererInstanceIds.Count,
+                        rendererInstanceIds = mat.rendererInstanceIds,
+                        rendererNames = mat.rendererNames,
+                        isVisibleInView = mat.visibleRendererInstanceIds.Count > 0,
+                        visibleRendererUsageCount = mat.visibleRendererInstanceIds.Count,
+                        visibleRendererInstanceIds = mat.visibleRendererInstanceIds,
+                        visibleRendererNames = mat.visibleRendererNames
+                    });
+                }
+
+                suggestion.currentCombinedTextureScore = combinedScore;
+                suggestion.totalRenderersCount = totalRenderers;
+
+                long estimatedPackArea = (long)(totalArea * 1.25);
+                if (estimatedPackArea <= 512 * 512)
+                    suggestion.suggestedAtlasSize = "512 x 512";
+                else if (estimatedPackArea <= 1024 * 1024)
+                    suggestion.suggestedAtlasSize = "1024 x 1024";
+                else if (estimatedPackArea <= 2048 * 2048)
+                    suggestion.suggestedAtlasSize = "2048 x 2048";
+                else if (estimatedPackArea <= 4096 * 4096)
+                    suggestion.suggestedAtlasSize = "4096 x 4096";
+                else
+                    suggestion.suggestedAtlasSize = "Multiple 2048 x 2048 Atlases";
+
+                list.Add(suggestion);
+            }
+
+            return list;
+        }
+
+        public static string GetSimpleShaderName(string fullShader)
+        {
+            if (string.IsNullOrEmpty(fullShader)) return "Standard";
+            int idx = fullShader.LastIndexOf('/');
+            if (idx >= 0 && idx < fullShader.Length - 1)
+                fullShader = fullShader.Substring(idx + 1);
+            int bsIdx = fullShader.LastIndexOf('\\');
+            if (bsIdx >= 0 && bsIdx < fullShader.Length - 1)
+                fullShader = fullShader.Substring(bsIdx + 1);
+            return fullShader.Replace(".shader", "");
+        }
+
         private static bool IsIgnoredRenderer(Renderer r)
         {
             if (r == null) return true;
@@ -748,12 +897,26 @@ namespace AceModules.LiveSceneAuditor
             return false;
         }
 
+        public static bool IsModelAssetPath(string path)
+        {
+            if (string.IsNullOrEmpty(path)) return false;
+            return path.EndsWith(".fbx", StringComparison.OrdinalIgnoreCase) ||
+                   path.EndsWith(".obj", StringComparison.OrdinalIgnoreCase) ||
+                   path.EndsWith(".blend", StringComparison.OrdinalIgnoreCase) ||
+                   path.EndsWith(".dae", StringComparison.OrdinalIgnoreCase) ||
+                   path.EndsWith(".3ds", StringComparison.OrdinalIgnoreCase);
+        }
+
         private static SceneAuditReport ProcessSnapshot(
             List<RendererSnapshot> renderers,
             List<TextureSnapshot> textures,
+            List<MaterialSnapshot> materials,
+            List<LightSnapshot> lights,
             CameraSnapshot camSnap,
             bool frustumOnly,
-            BudgetProfile profile)
+            BudgetProfile profile,
+            int fbxCount,
+            List<ViewpointSnapshot> viewpointSnaps = null)
         {
             SceneAuditReport report = new SceneAuditReport();
             report.isFrustumViewOnly = frustumOnly;
@@ -767,6 +930,7 @@ namespace AceModules.LiveSceneAuditor
 
             List<RendererSnapshot> visibleRenderers = new List<RendererSnapshot>();
             List<CulpritItem> meshCulprits = new List<CulpritItem>();
+            Dictionary<string, HashSet<int>> fbxVisibleRoots = new Dictionary<string, HashSet<int>>(StringComparer.OrdinalIgnoreCase);
 
             foreach (var r in renderers)
             {
@@ -796,451 +960,202 @@ namespace AceModules.LiveSceneAuditor
                         uniqueMaterialIds.Add(matId);
                     }
 
-                    // Collect all visible meshes for culprit ranking
-                    if (r.triangleCount > 0)
+                    if (r.isModelAsset && !string.IsNullOrEmpty(r.fbxAssetPath))
                     {
-                        float triBudgetRatio = profile.maxTriangles > 0 ? ((float)r.triangleCount / profile.maxTriangles) : 0f;
-                        float triPercent = triBudgetRatio * 100f;
-
-                        bool isHighPoly = r.triangleCount >= profile.singleMeshHeavyTriangles;
-                        bool isMultiMat = r.materialCount > profile.maxMaterialsPerObject;
-                        bool isMissingLod = !r.isPartOfLOD && r.triangleCount >= profile.requireLodAboveTriangles;
-
-                        List<string> reasons = new List<string>();
-                        float weight = triBudgetRatio * 1000f;
-
-                        if (isHighPoly)
+                        if (!fbxVisibleRoots.TryGetValue(r.fbxAssetPath, out var visSet))
                         {
-                            reasons.Add($"High Poly ({r.triangleCount:N0} Tris)");
-                            weight += 150f;
+                            visSet = new HashSet<int>();
+                            fbxVisibleRoots[r.fbxAssetPath] = visSet;
                         }
-                        if (isMultiMat)
-                        {
-                            reasons.Add($"Multi-Material ({r.materialCount} Mats)");
-                            weight += (r.materialCount * 75f);
-                        }
-                        if (isMissingLod)
-                        {
-                            reasons.Add("Missing LOD Group");
-                            weight += 120f;
-                        }
-
-                        meshCulprits.Add(new CulpritItem
-                        {
-                            name = r.name,
-                            instanceId = r.instanceId,
-                            type = CulpritType.MeshGeometry,
-                            triangleCount = r.triangleCount,
-                            vertexCount = r.vertexCount,
-                            primaryMetricText = $"{r.triangleCount:N0} Tris ({triPercent:F1}%)",
-                            secondaryDetailText = $"{r.vertexCount:N0} Verts • {r.materialCount} Mats",
-                            severityScore = weight,
-                            isHighPoly = isHighPoly,
-                            isMultiMaterial = isMultiMat,
-                            isMissingLod = isMissingLod,
-                            flaggedReasons = reasons,
-                            dependencyNames = r.materialNames
-                        });
+                        visSet.Add(r.modelInstanceRootId);
                     }
                 }
             }
 
-            // --- RUNTIME BATCHING SIMULATOR ---
-            // Simulates exact draw call batching behavior (Static Batching, GPU Instancing, Dynamic Batching, Shadow Passes)
-            int simulatedBatches = 0;
-            int rawUnbatchedDraws = 0;
-            int staticBatchedCount = 0;
-            int instancedCount = 0;
+            // Collect and rank culprits from visible renderers
+            // Group FBX model assets so repeating models (like 756 coins) collapse into 1 clean row with total geometry & occurrence counts
+            var fbxGroups = visibleRenderers
+                .Where(r => r.isModelAsset && !string.IsNullOrEmpty(r.fbxAssetPath))
+                .GroupBy(r => r.fbxAssetPath);
 
-            Dictionary<int, List<RendererSnapshot>> matToRenderers = new Dictionary<int, List<RendererSnapshot>>();
-            HashSet<int> shadowCastingMatIds = new HashSet<int>();
-
-            foreach (var r in visibleRenderers)
+            foreach (var group in fbxGroups)
             {
-                int mCount = Mathf.Max(1, r.materialCount);
-                rawUnbatchedDraws += mCount;
-                if (r.castsShadows)
+                var rep = group.First();
+                string fbxPath = group.Key;
+                string fbxName = !string.IsNullOrEmpty(rep.fbxName) 
+                    ? rep.fbxName 
+                    : System.IO.Path.GetFileNameWithoutExtension(fbxPath);
+
+                int occurrences = rep.fbxSceneOccurrences;
+                int visOccurrences = 0;
+                if (fbxVisibleRoots.TryGetValue(fbxPath, out var visSet))
                 {
-                    rawUnbatchedDraws += mCount; // shadow caster draw
-                }
-
-                for (int m = 0; m < r.materialInstanceIds.Count; m++)
-                {
-                    int mId = r.materialInstanceIds[m];
-                    if (!matToRenderers.TryGetValue(mId, out var rList))
-                    {
-                        rList = new List<RendererSnapshot>();
-                        matToRenderers[mId] = rList;
-                    }
-                    rList.Add(r);
-                }
-            }
-
-            // Directional light shadow casters partitioned by physical cascade distance
-            HashSet<int> cascade0Mats = new HashSet<int>();
-            HashSet<int> cascade1Mats = new HashSet<int>();
-            HashSet<int> cascade2Mats = new HashSet<int>();
-            HashSet<int> cascade3Mats = new HashSet<int>();
-
-            if (camSnap.hasDirectionalShadows)
-            {
-                float maxDist = camSnap.shadowDistance;
-                float split0, split1, split2;
-
-                if (camSnap.shadowCascades >= 4)
-                {
-                    split0 = maxDist * 0.0667f;
-                    split1 = maxDist * 0.2f;
-                    split2 = maxDist * 0.4667f;
+                    visOccurrences = visSet.Count;
                 }
                 else
                 {
-                    split0 = maxDist * 0.3333f;
-                    split1 = maxDist;
-                    split2 = maxDist;
+                    visOccurrences = group.Select(r => r.modelInstanceRootId).Distinct().Count();
                 }
 
-                foreach (var r in renderers)
+                // Total triangles across all visible instances of this FBX
+                int groupTotalTris = group.Sum(r => r.triangleCount);
+                int groupTotalVerts = group.Sum(r => r.vertexCount);
+
+                int visInstanceCount = Mathf.Max(1, visOccurrences);
+                int trisPerInstance = groupTotalTris / visInstanceCount;
+                int vertsPerInstance = groupTotalVerts / visInstanceCount;
+
+                List<string> allMatNames = group.SelectMany(r => r.materialNames).Distinct().ToList();
+
+                float triBudgetRatio = profile.maxTriangles > 0 ? ((float)groupTotalTris / profile.maxTriangles) : 0f;
+                float triPercent = triBudgetRatio * 100f;
+
+                bool isHighPoly = trisPerInstance >= profile.singleMeshHeavyTriangles;
+                bool isMultiMat = allMatNames.Count > profile.maxMaterialsPerObject;
+                bool isMissingLod = !rep.isPartOfLOD && trisPerInstance >= profile.requireLodAboveTriangles;
+
+                List<string> reasons = new List<string>();
+                float weight = triBudgetRatio * 1000f;
+                if (occurrences > 1)
                 {
-                    if (r.isActiveLOD && r.castsShadows)
-                    {
-                        float centerDist = Vector3.Distance(r.worldBounds.center, camSnap.position);
-                        float radius = r.worldBounds.extents.magnitude;
-                        float near = Mathf.Max(0f, centerDist - radius);
-                        float far = centerDist + radius;
-
-                        if (near <= maxDist)
-                        {
-                            if (camSnap.shadowCascades >= 4)
-                            {
-                                if (near <= split0)
-                                {
-                                    foreach (var mId in r.materialInstanceIds) cascade0Mats.Add(mId);
-                                }
-                                if (far >= split0 && near <= split1)
-                                {
-                                    foreach (var mId in r.materialInstanceIds) cascade1Mats.Add(mId);
-                                }
-                                if (far >= split1 && near <= split2)
-                                {
-                                    foreach (var mId in r.materialInstanceIds) cascade2Mats.Add(mId);
-                                }
-                                if (far >= split2 && near <= maxDist)
-                                {
-                                    foreach (var mId in r.materialInstanceIds) cascade3Mats.Add(mId);
-                                }
-                            }
-                            else if (camSnap.shadowCascades >= 2)
-                            {
-                                if (near <= split0)
-                                {
-                                    foreach (var mId in r.materialInstanceIds) cascade0Mats.Add(mId);
-                                }
-                                if (far >= split0 && near <= maxDist)
-                                {
-                                    foreach (var mId in r.materialInstanceIds) cascade1Mats.Add(mId);
-                                }
-                            }
-                            else
-                            {
-                                foreach (var mId in r.materialInstanceIds) cascade0Mats.Add(mId);
-                            }
-                        }
-                    }
-                }
-            }
-
-            foreach (var kvp in matToRenderers)
-            {
-                int matId = kvp.Key;
-                var rList = kvp.Value;
-
-                // Static Batching is split by lightmapIndex (Unity cannot batch objects across different lightmaps)
-                Dictionary<int, int> staticVertsPerLightmap = new Dictionary<int, int>();
-                int staticCount = 0;
-                int instancedInMat = 0;
-                int unbatchedInMat = 0;
-
-                for (int i = 0; i < rList.Count; i++)
-                {
-                    var r = rList[i];
-                    bool instancing = false;
-                    for (int m = 0; m < r.materialInstanceIds.Count; m++)
-                    {
-                        if (r.materialInstanceIds[m] == matId && m < r.materialInstancingEnabled.Count)
-                        {
-                            instancing = r.materialInstancingEnabled[m];
-                            break;
-                        }
-                    }
-
-                    if (r.isBatchingStatic && r.lightmapIndex >= 0)
-                    {
-                        int lm = r.lightmapIndex;
-                        if (!staticVertsPerLightmap.ContainsKey(lm))
-                        {
-                            staticVertsPerLightmap[lm] = 0;
-                        }
-                        staticVertsPerLightmap[lm] += r.vertexCount;
-                        staticCount++;
-                    }
-                    else if (instancing)
-                    {
-                        instancedInMat++;
-                    }
-                    else
-                    {
-                        // Dynamic Batching is disabled (m_DynamicBatching: 0), so each non-static object takes 1 draw call.
-                        // Non-lightmapped static objects (lightmapIndex < 0) sample Light Probes individually, requiring separate draw calls unless instanced.
-                        unbatchedInMat++;
-                    }
+                    // High occurrence scaling: surfaces repeated objects (e.g. 756 coins) in culprits ranking
+                    weight += Mathf.Min(500f, occurrences * 3f);
                 }
 
-                staticBatchedCount += staticCount;
-                instancedCount += instancedInMat;
-
-                // Static Batching: combines up to 64k vertices per lightmap per material
-                foreach (var lmVerts in staticVertsPerLightmap.Values)
+                if (isHighPoly)
                 {
-                    simulatedBatches += Mathf.Max(1, Mathf.CeilToInt((float)lmVerts / 64000f));
+                    reasons.Add($"High Poly ({trisPerInstance:N0} Tris)");
+                    weight += 150f;
+                }
+                if (isMultiMat)
+                {
+                    reasons.Add($"Multi-Material ({allMatNames.Count} Mats)");
+                    weight += (allMatNames.Count * 75f);
+                }
+                if (isMissingLod)
+                {
+                    reasons.Add("Missing LOD Group");
+                    weight += 120f;
+                }
+                if (occurrences >= 20)
+                {
+                    reasons.Add($"High Instance Count ({occurrences} Occurrences)");
                 }
 
-                // GPU Instancing: combines up to 500 instances per batch
-                if (instancedInMat > 0)
+                string occWord = occurrences == 1 ? "Occurrence" : "Occurrences";
+                string occText;
+                if (frustumOnly && visOccurrences > 0 && visOccurrences != occurrences)
                 {
-                    simulatedBatches += Mathf.Max(1, Mathf.CeilToInt((float)instancedInMat / 500f));
-                }
-
-                // Non-batched dynamic objects
-                simulatedBatches += unbatchedInMat;
-            }
-
-            // Depth-sorting batch breaks (interleaved front-to-back draw order in Built-in Forward)
-            int depthSortSplits = 0;
-            if (uniqueMaterialIds.Count > 10 && visibleRenderersCount > 20)
-            {
-                depthSortSplits = Mathf.Clamp(Mathf.RoundToInt(uniqueMaterialIds.Count * 0.12f), 1, 8);
-                simulatedBatches += depthSortSplits;
-            }
-
-            // Directional light shadow map passes across cascade splits
-            int shadowPassBatches = 0;
-            if (camSnap.hasDirectionalShadows)
-            {
-                if (camSnap.shadowCascades >= 4)
-                {
-                    shadowPassBatches = cascade0Mats.Count + cascade1Mats.Count + cascade2Mats.Count + cascade3Mats.Count;
-                }
-                else if (camSnap.shadowCascades >= 2)
-                {
-                    shadowPassBatches = cascade0Mats.Count + cascade1Mats.Count;
+                    occText = $" • {occurrences} FBX {occWord} in Scene ({visOccurrences} in View)";
                 }
                 else
                 {
-                    shadowPassBatches = cascade0Mats.Count;
+                    occText = $" • {occurrences} FBX {occWord} in Scene";
                 }
 
-                if (shadowPassBatches > 0)
+                string primaryMetric;
+                if (occurrences > 1)
                 {
-                    // Screen-Space Shadow Collector pass (soft directional shadows)
-                    shadowPassBatches += 1;
-                }
-
-                simulatedBatches += shadowPassBatches;
-            }
-
-            // Additional Pixel Lights (Point, Spot, Secondary Directional in ForwardAdd passes)
-            if (camSnap.pixelLights != null && camSnap.pixelLights.Count > 0)
-            {
-                for (int li = 0; li < camSnap.pixelLights.Count; li++)
-                {
-                    var pl = camSnap.pixelLights[li];
-                    Dictionary<int, List<RendererSnapshot>> litMatToRenderers = new Dictionary<int, List<RendererSnapshot>>();
-                    int litShadowCasters = 0;
-
-                    foreach (var r in visibleRenderers)
-                    {
-                        bool isLit = false;
-                        if (pl.type == LightType.Directional)
-                        {
-                            isLit = true;
-                        }
-                        else if (pl.type == LightType.Point)
-                        {
-                            Vector3 closest = r.worldBounds.ClosestPoint(pl.position);
-                            float sqrDist = (closest - pl.position).sqrMagnitude;
-                            if (sqrDist <= pl.range * pl.range)
-                            {
-                                isLit = true;
-                            }
-                        }
-                        else if (pl.type == LightType.Spot)
-                        {
-                            Vector3 closest = r.worldBounds.ClosestPoint(pl.position);
-                            float sqrDist = (closest - pl.position).sqrMagnitude;
-                            if (sqrDist <= pl.range * pl.range)
-                            {
-                                Vector3 toClosest = (closest - pl.position).normalized;
-                                float cosAngle = Mathf.Cos(pl.spotAngle * 0.5f * Mathf.Deg2Rad);
-                                if (Vector3.Dot(toClosest, pl.forward) >= cosAngle)
-                                {
-                                    isLit = true;
-                                }
-                            }
-                        }
-
-                        if (isLit)
-                        {
-                            rawUnbatchedDraws += Mathf.Max(1, r.materialCount);
-                            if (pl.shadowType != LightShadows.None && r.castsShadows)
-                            {
-                                litShadowCasters++;
-                                rawUnbatchedDraws += Mathf.Max(1, r.materialCount);
-                            }
-
-                            for (int m = 0; m < r.materialInstanceIds.Count; m++)
-                            {
-                                int mId = r.materialInstanceIds[m];
-                                if (!litMatToRenderers.TryGetValue(mId, out var rList))
-                                {
-                                    rList = new List<RendererSnapshot>();
-                                    litMatToRenderers[mId] = rList;
-                                }
-                                rList.Add(r);
-                            }
-                        }
-                    }
-
-                    // ForwardAdd draws for this light
-                    foreach (var kvp in litMatToRenderers)
-                    {
-                        int matId = kvp.Key;
-                        var rList = kvp.Value;
-                        Dictionary<int, int> litStaticVertsPerLm = new Dictionary<int, int>();
-                        int litInstanced = 0;
-                        int litUnbatched = 0;
-
-                        for (int i = 0; i < rList.Count; i++)
-                        {
-                            var r = rList[i];
-                            bool instancing = false;
-                            for (int m = 0; m < r.materialInstanceIds.Count; m++)
-                            {
-                                if (r.materialInstanceIds[m] == matId && m < r.materialInstancingEnabled.Count)
-                                {
-                                    instancing = r.materialInstancingEnabled[m];
-                                    break;
-                                }
-                            }
-
-                            if (r.isBatchingStatic && r.lightmapIndex >= 0)
-                            {
-                                int lm = r.lightmapIndex;
-                                if (!litStaticVertsPerLm.ContainsKey(lm)) litStaticVertsPerLm[lm] = 0;
-                                litStaticVertsPerLm[lm] += r.vertexCount;
-                            }
-                            else if (instancing)
-                            {
-                                litInstanced++;
-                            }
-                            else
-                            {
-                                litUnbatched++;
-                            }
-                        }
-
-                        foreach (var lmVerts in litStaticVertsPerLm.Values)
-                        {
-                            simulatedBatches += Mathf.Max(1, Mathf.CeilToInt((float)lmVerts / 64000f));
-                        }
-                        if (litInstanced > 0)
-                        {
-                            simulatedBatches += Mathf.Max(1, Mathf.CeilToInt((float)litInstanced / 500f));
-                        }
-                        simulatedBatches += litUnbatched;
-                    }
-
-                    // Shadow passes for this additional light
-                    if (pl.shadowType != LightShadows.None && litShadowCasters > 0)
-                    {
-                        if (pl.type == LightType.Point)
-                        {
-                            simulatedBatches += Mathf.Clamp(litShadowCasters, 1, 6);
-                        }
-                        else if (pl.type == LightType.Spot)
-                        {
-                            simulatedBatches += 1;
-                        }
-                    }
-                }
-            }
-
-            // Active UI Canvases (Screen-Space / Game HUD)
-            simulatedBatches += camSnap.activeCanvasDrawCalls;
-
-            // Camera clear / Skybox pass
-            simulatedBatches += 1;
-
-            Debug.Log($"[AuditorScan] isPlaying={camSnap.isPlaying}, unityBatches={camSnap.unityStatsBatches}, simulatedBatches={simulatedBatches} " +
-                      $"(BaseDraws={simulatedBatches - shadowPassBatches - camSnap.activeCanvasDrawCalls - 1}, Shadows={shadowPassBatches}, " +
-                      $"Canvases={camSnap.activeCanvasDrawCalls}, Skybox=1), unityTris={camSnap.unityStatsTriangles}, unityVerts={camSnap.unityStatsVertices}, " +
-                      $"pixelLightsCount={(camSnap.pixelLights != null ? camSnap.pixelLights.Count : 0)}");
-
-            report.staticBatchedObjectsCount = staticBatchedCount;
-
-            if (frustumOnly && camSnap.isGameCamera)
-            {
-                if (camSnap.isPlaying)
-                {
-                    // In Play Mode, driver stats already reflect runtime static batching
-                    int playBatches = camSnap.unityStatsBatches > 0 ? camSnap.unityStatsBatches : (_cleanGameViewBatches > 0 ? _cleanGameViewBatches : rawUnbatchedDraws);
-                    report.visibleTriangles = camSnap.unityStatsTriangles > 0 ? camSnap.unityStatsTriangles : visibleTris;
-                    report.visibleVertices = camSnap.unityStatsVertices > 0 ? camSnap.unityStatsVertices : visibleVerts;
-                    report.estimatedBatches = playBatches;
-                    report.rawUnbatchedBatches = rawUnbatchedDraws > 0 ? rawUnbatchedDraws : playBatches;
-                    report.rawEditModeBatches = report.rawUnbatchedBatches;
-                    report.savedByBatching = Mathf.Max(0, report.rawUnbatchedBatches - playBatches);
+                    primaryMetric = $"{trisPerInstance:N0} Tris/inst ({groupTotalTris:N0} Total • {triPercent:F1}%)";
                 }
                 else
                 {
-                    // In Edit Mode, retrieve unpolluted Game View draws
-                    int cleanEditBatches = _cleanGameViewBatches > 0 ? _cleanGameViewBatches : camSnap.unityStatsBatches;
-                    if (cleanEditBatches <= 0)
-                        cleanEditBatches = (simulatedBatches > 0) ? simulatedBatches : rawUnbatchedDraws;
-
-                    if (camSnap.exactPlayModeBatches > 0)
-                    {
-                        // 100% exact verified Play Mode batches captured directly from GPU driver
-                        int exactBatches = camSnap.exactPlayModeBatches;
-                        report.estimatedBatches = exactBatches;
-                        report.savedByBatching = Mathf.Max(0, cleanEditBatches - exactBatches);
-                    }
-                    else
-                    {
-                        // Edit Mode uncombined baseline
-                        report.estimatedBatches = cleanEditBatches;
-                        report.savedByBatching = 0;
-                    }
-
-                    report.visibleTriangles = camSnap.unityStatsTriangles > 0 ? camSnap.unityStatsTriangles : visibleTris;
-                    report.visibleVertices = camSnap.unityStatsVertices > 0 ? camSnap.unityStatsVertices : visibleVerts;
-                    report.rawUnbatchedBatches = cleanEditBatches;
-                    report.rawEditModeBatches = cleanEditBatches;
+                    primaryMetric = $"{trisPerInstance:N0} Tris ({triPercent:F1}%)";
                 }
+
+                string secondaryDetail = $"{vertsPerInstance:N0} Verts • {allMatNames.Count} Mats{occText}";
+
+                string displayName = occurrences > 1 
+                    ? $"{occurrences}× {fbxName}" 
+                    : fbxName;
+
+                List<int> rootIds = rep.fbxSceneRootIds != null && rep.fbxSceneRootIds.Count > 0 
+                    ? rep.fbxSceneRootIds 
+                    : group.Select(r => r.modelInstanceRootId).Distinct().ToList();
+
+                meshCulprits.Add(new CulpritItem
+                {
+                    name = displayName,
+                    instanceId = rep.instanceId,
+                    type = CulpritType.MeshGeometry,
+                    triangleCount = groupTotalTris,
+                    vertexCount = groupTotalVerts,
+                    primaryMetricText = primaryMetric,
+                    secondaryDetailText = secondaryDetail,
+                    severityScore = weight,
+                    isHighPoly = isHighPoly,
+                    isMultiMaterial = isMultiMat,
+                    isMissingLod = isMissingLod,
+                    flaggedReasons = reasons,
+                    dependencyNames = allMatNames,
+                    fbxAssetPath = fbxPath,
+                    fbxName = fbxName,
+                    fbxOccurrences = occurrences,
+                    fbxVisibleOccurrences = visOccurrences,
+                    fbxInstanceRootIds = rootIds
+                });
             }
-            else
+
+            // Non-FBX standalone renderers (procedural meshes, primitives, etc.)
+            var nonFbxRenderers = visibleRenderers.Where(r => !r.isModelAsset || string.IsNullOrEmpty(r.fbxAssetPath));
+            foreach (var r in nonFbxRenderers)
             {
-                // Full Scene or non-game-camera fallback: Exact Simulated Runtime Batches
-                report.visibleTriangles = (frustumOnly && camSnap.isGameCamera && camSnap.unityStatsTriangles > 0) ? camSnap.unityStatsTriangles : visibleTris;
-                report.visibleVertices = (frustumOnly && camSnap.isGameCamera && camSnap.unityStatsVertices > 0) ? camSnap.unityStatsVertices : visibleVerts;
-                report.estimatedBatches = (simulatedBatches > 0) ? simulatedBatches : Mathf.Max(uniqueMaterialIds.Count, Mathf.RoundToInt(visibleRenderersCount * 0.8f));
-                report.savedByBatching = Mathf.Max(0, rawUnbatchedDraws - report.estimatedBatches);
-                report.rawUnbatchedBatches = rawUnbatchedDraws;
-                report.rawEditModeBatches = rawUnbatchedDraws;
+                if (r.triangleCount <= 0) continue;
+                float triBudgetRatio = profile.maxTriangles > 0 ? ((float)r.triangleCount / profile.maxTriangles) : 0f;
+                float triPercent = triBudgetRatio * 100f;
+
+                bool isHighPoly = r.triangleCount >= profile.singleMeshHeavyTriangles;
+                bool isMultiMat = r.materialCount > profile.maxMaterialsPerObject;
+                bool isMissingLod = !r.isPartOfLOD && r.triangleCount >= profile.requireLodAboveTriangles;
+
+                List<string> reasons = new List<string>();
+                float weight = triBudgetRatio * 1000f;
+
+                if (isHighPoly)
+                {
+                    reasons.Add($"High Poly ({r.triangleCount:N0} Tris)");
+                    weight += 150f;
+                }
+                if (isMultiMat)
+                {
+                    reasons.Add($"Multi-Material ({r.materialCount} Mats)");
+                    weight += (r.materialCount * 75f);
+                }
+                if (isMissingLod)
+                {
+                    reasons.Add("Missing LOD Group");
+                    weight += 120f;
+                }
+
+                meshCulprits.Add(new CulpritItem
+                {
+                    name = r.name,
+                    instanceId = r.instanceId,
+                    type = CulpritType.MeshGeometry,
+                    triangleCount = r.triangleCount,
+                    vertexCount = r.vertexCount,
+                    primaryMetricText = $"{r.triangleCount:N0} Tris ({triPercent:F1}%)",
+                    secondaryDetailText = $"{r.vertexCount:N0} Verts • {r.materialCount} Mats",
+                    severityScore = weight,
+                    isHighPoly = isHighPoly,
+                    isMultiMaterial = isMultiMat,
+                    isMissingLod = isMissingLod,
+                    flaggedReasons = reasons,
+                    dependencyNames = r.materialNames,
+                    fbxAssetPath = "",
+                    fbxName = "",
+                    fbxOccurrences = 1,
+                    fbxVisibleOccurrences = 1,
+                    fbxInstanceRootIds = new List<int> { r.instanceId }
+                });
             }
+
+            report.visibleTriangles = (frustumOnly && camSnap.isGameCamera && camSnap.unityStatsTriangles > 0) ? camSnap.unityStatsTriangles : visibleTris;
+            report.visibleVertices = (frustumOnly && camSnap.isGameCamera && camSnap.unityStatsVertices > 0) ? camSnap.unityStatsVertices : visibleVerts;
             report.totalSceneTriangles = totalTris;
             report.totalSceneVertices = totalVerts;
             report.uniqueMaterialsCount = uniqueMaterialIds.Count;
+            report.fbxModelCount = fbxCount;
 
             // Texture Score & Texture Culprits (Whole Scene VRAM)
             float totalTexScore = 0f;
@@ -1261,6 +1176,8 @@ namespace AceModules.LiveSceneAuditor
                         instanceId = t.instanceId,
                         type = CulpritType.TextureSize,
                         textureScore = t.score,
+                        textureWidth = t.width,
+                        textureHeight = t.height,
                         primaryMetricText = $"{t.width}x{t.height} (Score: {t.score:F1} • {texPercent:F1}%)",
                         secondaryDetailText = $"Used in: {(t.usedInMaterials.Count > 0 ? string.Join(", ", t.usedInMaterials.Take(2)) : "Scene")}",
                         severityScore = texBudgetRatio * 1000f,
@@ -1271,20 +1188,217 @@ namespace AceModules.LiveSceneAuditor
 
             report.textureAreaScore = totalTexScore;
 
-            // Sort top 15 meshes and top 15 textures by severity
-            var sortedMeshes = meshCulprits.OrderByDescending(c => c.triangleCount).Take(15);
-            var sortedTextures = texCulprits.OrderByDescending(c => c.textureScore).Take(15);
-            
-            report.culprits.AddRange(sortedMeshes);
-            report.culprits.AddRange(sortedTextures);
+            // Process Lights
+            int totalLights = 0;
+            int dirLights = 0;
+            int ptLights = 0;
+            int sptLights = 0;
+            int areaLights = 0;
+            int otherLights = 0;
+
+            int rtLights = 0;
+            int bkLights = 0;
+            int mxLights = 0;
+            int shadowLights = 0;
+            int visLights = 0;
+            int inactLights = 0;
+
+            List<CulpritItem> lightCulprits = new List<CulpritItem>();
+
+            if (lights != null)
+            {
+                // First pass: tally total scene-wide stats
+                foreach (var l in lights)
+                {
+                    if (!l.isActiveAndEnabled)
+                    {
+                        inactLights++;
+                        continue;
+                    }
+
+                    totalLights++;
+                    if (l.isVisibleInView) visLights++;
+
+                    switch (l.type)
+                    {
+                        case LightType.Directional:
+                            dirLights++;
+                            break;
+                        case LightType.Point:
+                            ptLights++;
+                            break;
+                        case LightType.Spot:
+                            sptLights++;
+                            break;
+                        case LightType.Area:
+                        case LightType.Disc:
+                            areaLights++;
+                            break;
+                        default:
+                            otherLights++;
+                            break;
+                    }
+
+                    if (l.isRealtime) rtLights++;
+                    else if (l.isBaked) bkLights++;
+                    else if (l.isMixed) mxLights++;
+
+                    if (l.shadows != LightShadows.None && !l.isBaked)
+                    {
+                        shadowLights++;
+                    }
+                }
+
+                // Second pass: Group lights by identical component settings
+                // Lights sharing identical type, baking type, shadows, intensity, range, color, spot angle, and active state collapse into a single row
+                var groupedLights = lights.GroupBy(l =>
+                {
+                    string hexCol = ColorUtility.ToHtmlStringRGB(l.color);
+                    float r = (l.type == LightType.Directional) ? 0f : (Mathf.Round(l.range * 100f) / 100f);
+                    float intens = Mathf.Round(l.intensity * 100f) / 100f;
+                    float angle = (l.type == LightType.Spot) ? (Mathf.Round(l.spotAngle * 10f) / 10f) : 0f;
+                    string bakeMode = l.isBaked ? "Baked" : (l.isMixed ? "Mixed" : "Realtime");
+                    return $"{l.type}_{bakeMode}_{l.shadows}_{intens}_{r}_{hexCol}_{angle}_{l.renderMode}_{l.isActiveAndEnabled}";
+                });
+
+                foreach (var group in groupedLights)
+                {
+                    var rep = group.First();
+                    int count = group.Count();
+                    int groupVisCount = group.Count(l => l.isVisibleInView);
+                    List<int> instanceIds = group.Select(l => l.instanceId).ToList();
+                    List<string> lightNames = group.Select(l => l.name).ToList();
+
+                    bool castsShadows = (rep.shadows != LightShadows.None);
+                    bool isBaked = rep.isBaked;
+                    string shadowText = castsShadows ? $"{rep.shadows} Shadows" : "No Shadows";
+                    string bakeMode = isBaked ? "Baked" : (rep.isMixed ? "Mixed" : "Realtime");
+                    if (!rep.isActiveAndEnabled) bakeMode = "Inactive";
+
+                    List<string> reasons = new List<string>();
+                    float baseSeverity = 0f;
+
+                    if (!rep.isActiveAndEnabled)
+                    {
+                        baseSeverity = 0f;
+                    }
+                    else
+                    {
+                        if (rep.type == LightType.Point && castsShadows && !isBaked)
+                        {
+                            reasons.Add("Point Light Realtime Shadows (6 Cubemap Passes)");
+                            baseSeverity += 120f;
+                        }
+
+                        if (rep.type == LightType.Directional && dirLights > profile.maxDirectionalLights)
+                        {
+                            reasons.Add($"Exceeds Directional Budget ({dirLights} in scene, max {profile.maxDirectionalLights})");
+                            baseSeverity += 100f;
+                        }
+
+                        if (rep.type == LightType.Spot && castsShadows && !isBaked && shadowLights > profile.maxRealtimeShadowCasters)
+                        {
+                            reasons.Add($"Exceeds Shadow Casters Budget ({shadowLights} in scene, max {profile.maxRealtimeShadowCasters})");
+                            baseSeverity += 70f;
+                        }
+
+                        if (rep.range > 25f && rep.type == LightType.Point)
+                        {
+                            reasons.Add($"Large Point Range ({rep.range:F0}m affects many objects)");
+                            baseSeverity += 40f;
+                        }
+                    }
+
+                    float totalSeverity = baseSeverity * count;
+
+                    string primaryMetric = count > 1
+                        ? $"{bakeMode} {rep.type} ({shadowText}) • {count} Lights"
+                        : $"{bakeMode} {rep.type} ({shadowText})";
+
+                    string hexCol = ColorUtility.ToHtmlStringRGB(rep.color);
+                    string colName = hexCol == "FFFFFF" ? "White" : $"#{hexCol}";
+
+                    string secondaryDetail;
+                    if (!rep.isActiveAndEnabled)
+                    {
+                        secondaryDetail = $"Disabled • Range: {rep.range:F1}m • Intensity: {rep.intensity:F2} • ({count} instances)";
+                    }
+                    else if (rep.type == LightType.Directional)
+                    {
+                        secondaryDetail = $"Intensity: {rep.intensity:F2} • Color: {colName} • In View: {groupVisCount}/{count}";
+                    }
+                    else
+                    {
+                        secondaryDetail = $"Range: {rep.range:F1}m • Intensity: {rep.intensity:F2} • Color: {colName} • In View: {groupVisCount}/{count}";
+                    }
+
+                    string displayName = count > 1 
+                        ? $"{count}× {rep.type} Light" 
+                        : rep.name;
+
+                    lightCulprits.Add(new CulpritItem
+                    {
+                        name = displayName,
+                        instanceId = rep.instanceId,
+                        type = CulpritType.Light,
+                        primaryMetricText = primaryMetric,
+                        secondaryDetailText = secondaryDetail,
+                        severityScore = totalSeverity,
+                        flaggedReasons = reasons,
+                        dependencyNames = lightNames,
+                        lightType = rep.type,
+                        lightShadows = rep.shadows,
+                        lightRange = rep.range,
+                        lightIntensity = rep.intensity,
+                        lightIsRealtime = rep.isRealtime,
+                        lightIsBaked = rep.isBaked,
+                        lightIsMixed = rep.isMixed,
+                        lightOccurrences = count,
+                        lightVisibleOccurrences = groupVisCount,
+                        lightInstanceIds = instanceIds,
+                        lightNames = lightNames
+                    });
+                }
+            }
+
+            report.totalLightsCount = totalLights;
+            report.directionalLightsCount = dirLights;
+            report.pointLightsCount = ptLights;
+            report.spotLightsCount = sptLights;
+            report.areaLightsCount = areaLights;
+            report.otherLightsCount = otherLights;
+            report.realtimeLightsCount = rtLights;
+            report.bakedLightsCount = bkLights;
+            report.mixedLightsCount = mxLights;
+            report.shadowCasterLightsCount = shadowLights;
+            report.visibleLightsCount = visLights;
+            report.inactiveLightsCount = inactLights;
+
+            // Store all detected mesh, texture, and light culprits (ordered by severity score)
+            // The display limit (Top N) is dynamically controlled by the designer in the LiveSceneAuditorWindow
+            report.culprits.AddRange(meshCulprits.OrderByDescending(c => c.severityScore));
+            report.culprits.AddRange(texCulprits.OrderByDescending(c => c.severityScore));
+            report.culprits.AddRange(lightCulprits.OrderByDescending(c => c.severityScore));
             report.culprits = report.culprits.OrderByDescending(c => c.severityScore).ToList();
 
-            // Calculate budget comparison
-            float triRatio = profile.maxTriangles > 0 ? ((float)visibleTris / profile.maxTriangles) : 0f;
-            float batchRatio = profile.maxBatches > 0 ? ((float)report.estimatedBatches / profile.maxBatches) : 0f;
-            float texRatio = profile.maxTextureScore > 0 ? (totalTexScore / profile.maxTextureScore) : 0f;
+            // Generate Smart Atlasing Suggestions
+            report.atlasSuggestions = GenerateAtlasSuggestions(materials);
 
-            float maxRatio = Mathf.Max(triRatio, Mathf.Max(batchRatio, texRatio));
+            // Calculate budget comparison based on Geometry, Materials, FBXs, Textures, and Lights
+            float triRatio = profile.maxTriangles > 0 ? ((float)report.visibleTriangles / profile.maxTriangles) : 0f;
+            float vertRatio = profile.maxVertices > 0 ? ((float)report.visibleVertices / profile.maxVertices) : 0f;
+            float matRatio = profile.maxMaterialsInScene > 0 ? ((float)uniqueMaterialIds.Count / profile.maxMaterialsInScene) : 0f;
+            float texRatio = profile.maxTextureScore > 0 ? (totalTexScore / profile.maxTextureScore) : 0f;
+            float fbxRatio = profile.maxFbxInScene > 0 ? ((float)fbxCount / profile.maxFbxInScene) : 0f;
+
+            float dirRatio = profile.maxDirectionalLights > 0 ? ((float)report.directionalLightsCount / profile.maxDirectionalLights) : 0f;
+            float ptRatio = profile.maxPointLights > 0 ? ((float)report.pointLightsCount / profile.maxPointLights) : 0f;
+            float sptRatio = profile.maxSpotLights > 0 ? ((float)report.spotLightsCount / profile.maxSpotLights) : 0f;
+            float totLightRatio = profile.maxTotalLights > 0 ? ((float)report.totalLightsCount / profile.maxTotalLights) : 0f;
+            float shadowRatio = profile.maxRealtimeShadowCasters > 0 ? ((float)report.shadowCasterLightsCount / profile.maxRealtimeShadowCasters) : 0f;
+
+            float maxRatio = Mathf.Max(triRatio, Mathf.Max(vertRatio, Mathf.Max(matRatio, Mathf.Max(texRatio, Mathf.Max(fbxRatio,
+                Mathf.Max(dirRatio, Mathf.Max(ptRatio, Mathf.Max(sptRatio, Mathf.Max(totLightRatio, shadowRatio)))))))));
             report.overallHealthPercentage = Mathf.Round(maxRatio * 100f);
             report.isOverBudget = maxRatio >= 1.0f;
 
@@ -1299,6 +1413,170 @@ namespace AceModules.LiveSceneAuditor
             else
             {
                 report.statusSummary = $"HEALTHY ({report.overallHealthPercentage}%)";
+            }
+
+            // Compute View-Based Stats for each configured vantage point
+            if (viewpointSnaps != null && viewpointSnaps.Count > 0)
+            {
+                foreach (var vp in viewpointSnaps)
+                {
+                    int vpTris = 0;
+                    int vpVerts = 0;
+                    int vpRenderersCount = 0;
+                    HashSet<int> vpMatIds = new HashSet<int>();
+                    List<string> vpMatNames = new List<string>();
+                    List<ViewpointContributingObject> vpContributingRends = new List<ViewpointContributingObject>();
+                    List<ViewpointContributingLight> vpContributingLights = new List<ViewpointContributingLight>();
+
+                    string topCulpritName = "None";
+                    int topCulpritTris = 0;
+                    float topCulpritSeverity = 0f;
+
+                    foreach (var r in renderers)
+                    {
+                        if (!r.isActiveLOD) continue;
+                        if (TestPlanesAABBThreadSafe(vp.frustumPlanes, r.worldBounds))
+                        {
+                            vpTris += r.triangleCount;
+                            vpVerts += r.vertexCount;
+                            vpRenderersCount++;
+
+                            for (int m = 0; m < r.materialInstanceIds.Count; m++)
+                            {
+                                int matId = r.materialInstanceIds[m];
+                                if (!vpMatIds.Contains(matId))
+                                {
+                                    vpMatIds.Add(matId);
+                                    if (m < r.materialNames.Count)
+                                    {
+                                        vpMatNames.Add(r.materialNames[m]);
+                                    }
+                                }
+                            }
+
+                            vpContributingRends.Add(new ViewpointContributingObject
+                            {
+                                instanceId = r.instanceId,
+                                name = r.name,
+                                triangleCount = r.triangleCount,
+                                vertexCount = r.vertexCount,
+                                materialCount = r.materialCount,
+                                materialInstanceIds = r.materialInstanceIds != null ? new List<int>(r.materialInstanceIds) : new List<int>(),
+                                materialNames = r.materialNames != null ? new List<string>(r.materialNames) : new List<string>(),
+                                textureInstanceIds = r.textureInstanceIds != null ? new List<int>(r.textureInstanceIds) : new List<int>(),
+                                textureNames = r.textureNames != null ? new List<string>(r.textureNames) : new List<string>(),
+                                isModelAsset = r.isModelAsset,
+                                fbxName = r.fbxName,
+                                fbxAssetPath = r.fbxAssetPath
+                            });
+
+                            if (r.triangleCount > topCulpritTris)
+                            {
+                                topCulpritTris = r.triangleCount;
+                                topCulpritName = !string.IsNullOrEmpty(r.fbxName) ? r.fbxName : r.name;
+                                float triBudgetRatio = profile.maxTriangles > 0 ? ((float)r.triangleCount / profile.maxTriangles) : 0f;
+                                topCulpritSeverity = triBudgetRatio * 1000f;
+                            }
+                        }
+                    }
+
+                    // Sort contributing meshes by polygon count (highest impact first)
+                    vpContributingRends.Sort((a, b) => b.triangleCount.CompareTo(a.triangleCount));
+
+                    // Tally visible lights in this viewpoint's frustum
+                    int vpVisLights = 0;
+                    int vpDirLights = 0;
+                    int vpPtLights = 0;
+                    int vpSptLights = 0;
+                    int vpShadowCasters = 0;
+
+                    if (lights != null)
+                    {
+                        foreach (var l in lights)
+                        {
+                            if (!l.isActiveAndEnabled) continue;
+
+                            bool isVis = false;
+                            if (l.type == LightType.Directional)
+                            {
+                                isVis = true;
+                            }
+                            else
+                            {
+                                isVis = TestSphereFrustum(l.position, Mathf.Max(0.1f, l.range), vp.frustumPlanes);
+                            }
+
+                            if (isVis)
+                            {
+                                vpVisLights++;
+                                if (l.type == LightType.Directional) vpDirLights++;
+                                else if (l.type == LightType.Point) vpPtLights++;
+                                else if (l.type == LightType.Spot) vpSptLights++;
+
+                                if (l.shadows != LightShadows.None && !l.isBaked)
+                                {
+                                    vpShadowCasters++;
+                                }
+
+                                vpContributingLights.Add(new ViewpointContributingLight
+                                {
+                                    instanceId = l.instanceId,
+                                    name = l.name,
+                                    type = l.type,
+                                    shadows = l.shadows,
+                                    isRealtime = l.isRealtime,
+                                    isBaked = l.isBaked,
+                                    isMixed = l.isMixed,
+                                    range = l.range,
+                                    intensity = l.intensity
+                                });
+                            }
+                        }
+                    }
+
+                    // Calculate budget health for this viewpoint
+                    float vpTriRatio = profile.maxTriangles > 0 ? ((float)vpTris / profile.maxTriangles) : 0f;
+                    float vpVertRatio = profile.maxVertices > 0 ? ((float)vpVerts / profile.maxVertices) : 0f;
+                    float vpMatRatio = profile.maxMaterialsInScene > 0 ? ((float)vpMatIds.Count / profile.maxMaterialsInScene) : 0f;
+                    float vpDirRatio = profile.maxDirectionalLights > 0 ? ((float)vpDirLights / profile.maxDirectionalLights) : 0f;
+                    float vpPtRatio = profile.maxPointLights > 0 ? ((float)vpPtLights / profile.maxPointLights) : 0f;
+                    float vpSptRatio = profile.maxSpotLights > 0 ? ((float)vpSptLights / profile.maxSpotLights) : 0f;
+                    float vpTotLightRatio = profile.maxTotalLights > 0 ? ((float)vpVisLights / profile.maxTotalLights) : 0f;
+                    float vpShadowRatio = profile.maxRealtimeShadowCasters > 0 ? ((float)vpShadowCasters / profile.maxRealtimeShadowCasters) : 0f;
+
+                    float vpMaxRatio = Mathf.Max(vpTriRatio, Mathf.Max(vpVertRatio, Mathf.Max(vpMatRatio,
+                        Mathf.Max(vpDirRatio, Mathf.Max(vpPtRatio, Mathf.Max(vpSptRatio, Mathf.Max(vpTotLightRatio, vpShadowRatio)))))));
+
+                    float vpHealthPct = Mathf.Round(vpMaxRatio * 100f);
+                    bool vpIsOver = vpMaxRatio >= 1.0f;
+                    string vpStatus = vpIsOver ? $"OVER BUDGET ({vpHealthPct:F0}%)" : (vpMaxRatio >= 0.75f ? $"WARNING ({vpHealthPct:F0}%)" : $"PASS ({vpHealthPct:F0}%)");
+
+                    report.viewpointStats.Add(new ViewpointAuditStat
+                    {
+                        viewpointName = vp.name,
+                        transformInstanceId = vp.instanceId,
+                        position = vp.position,
+                        rotationEuler = vp.rotationEuler,
+                        visibleTriangles = vpTris,
+                        visibleVertices = vpVerts,
+                        visibleRenderersCount = vpRenderersCount,
+                        uniqueMaterialsCount = vpMatIds.Count,
+                        materialNames = vpMatNames,
+                        visibleLightsCount = vpVisLights,
+                        directionalLightsCount = vpDirLights,
+                        pointLightsCount = vpPtLights,
+                        spotLightsCount = vpSptLights,
+                        shadowCasterLightsCount = vpShadowCasters,
+                        healthPercentage = vpHealthPct,
+                        isOverBudget = vpIsOver,
+                        statusSummary = vpStatus,
+                        topCulpritName = topCulpritName,
+                        topCulpritTris = topCulpritTris,
+                        topCulpritSeverity = topCulpritSeverity,
+                        contributingRenderers = vpContributingRends,
+                        contributingLights = vpContributingLights
+                    });
+                }
             }
 
             return report;
